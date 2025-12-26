@@ -101,6 +101,12 @@ class Go2Env:
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
 
+            #追加（速度追従平均二乗誤差のグラフ）
+            #誤差を貯めるバケツ（辞書）を作る
+            self.episode_error_sums = dict()
+            self.episode_error_sums["vel_xy"]  = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
+            self.episode_error_sums["vel_yaw"] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
+
         # initialize buffers
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
@@ -253,6 +259,17 @@ class Go2Env:
         # Reset jump command
         self.commands[:, 4] = 0.0
 
+        #追加(速度追従平均二乗誤差のグラフ)
+        #誤差を計算してバケツ（辞書）に足す
+        # 1. 速度(XY)のズレの二乗
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        # 2. 回転(Yaw)のズレの二乗
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+
+        # 3. バッファに蓄積 (dtを掛けて積分)
+        self.episode_error_sums["vel_xy"]  += lin_vel_error * self.dt
+        self.episode_error_sums["vel_yaw"] += ang_vel_error * self.dt
+
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
@@ -299,6 +316,17 @@ class Go2Env:
                 torch.mean(self.episode_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
             )
             self.episode_sums[key][envs_idx] = 0.0
+
+        
+        # 追加（速度追従平均二乗誤差のグラフ）
+        # 誤差ログの記録
+        for key in self.episode_error_sums.keys():
+            # 平均誤差を計算して "error_○○" という名前で登録
+            self.extras["episode"]["error_" + key] = (
+                torch.mean(self.episode_error_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
+            )
+            # バケツを空にする
+            self.episode_error_sums[key][envs_idx] = 0.0
 
         self._sample_commands(envs_idx)
         

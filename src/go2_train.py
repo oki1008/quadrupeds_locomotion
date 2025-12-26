@@ -18,7 +18,7 @@ def get_train_cfg(exp_name, max_iterations):
             "entropy_coef": 0.01,
             "gamma": 0.99,
             "lam": 0.95,
-            "learning_rate": 0.001,
+            "learning_rate": 0.0005,
             "max_grad_norm": 1.0,
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
@@ -92,8 +92,8 @@ def get_cfgs():
         "kp": 20.0,
         "kd": 0.5,
         # termination
-        "termination_if_roll_greater_than": 10,  # degree
-        "termination_if_pitch_greater_than": 10,
+        "termination_if_roll_greater_than": 30,  # degree
+        "termination_if_pitch_greater_than": 30,
         # base pose
         "base_init_pos": [0.0, 0.0, 0.42],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
@@ -112,6 +112,7 @@ def get_cfgs():
             "dof_vel": 0.05,
         },
     }
+    
     reward_cfg = {
         "tracking_sigma": 0.25,
         "base_height_target": 0.3,
@@ -119,37 +120,39 @@ def get_cfgs():
         "jump_upward_velocity": 1.2,  
         "jump_reward_steps": 50,
         "reward_scales": {
-            "tracking_lin_vel": 1.0,
+            "tracking_lin_vel": 3.0,      
             "tracking_ang_vel": 0.2,
-            "lin_vel_z": -1.0,
+            "lin_vel_z": -2.0,
             "base_height": -50.0,
-            "action_rate": -0.005,
+            #"base_height": -1.0,
+            #"action_rate": -0.002,
+            "action_rate": -0.01,
             "similar_to_default": -0.1,
             # "jump": 4.0,
-            "jump_height_tracking": 0.5,
-            "jump_height_achievement": 10,
-            "jump_speed" : 1.0,
-            "jump_landing": 0.08,
+            #"jump_height_tracking": 0.5,
+            #"jump_height_achievement": 2.0,
+            #"jump_speed" : 1.0,
+            #"jump_landing": 0.08,
         },
     }
     command_cfg = {
         "num_commands": 5,  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
-        "lin_vel_x_range": [-1.0, 2.0],
+        "lin_vel_x_range": [-1.0, 1.0],
         "lin_vel_y_range": [-0.5, 0.5],
         "ang_vel_range": [-0.6, 0.6],
         # "lin_vel_x_range": [0.0, 0.0],
         # "lin_vel_y_range": [0.0, 0.0],
         # "ang_vel_range": [0.0, 0.0],
         "height_range": [0.2, 0.4],
-        "jump_range": [0.5, 1.5],
+        #"jump_range": [0.5, 1.5],
+        "jump_range": [0.0, 0.0],
     }
-
     return env_cfg, obs_cfg, reward_cfg, command_cfg
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="go2-walking")
+    parser.add_argument("-e", "--exp_name", type=str, default="go2_test")
     parser.add_argument("-B", "--num_envs", type=int, default=4096)
     parser.add_argument("--max_iterations", type=int, default=10000)
     parser.add_argument("--device", type=str, default="cuda:0", help="device to use: 'cpu' or 'cuda:0'")
@@ -176,6 +179,9 @@ def main():
     )
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=args.device)
+
+    #ここに続きから学習させたいファイルのパスを記入
+    #unner.load("logs/go2-walking/model_400.pt")
 
     pickle.dump(
         [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
