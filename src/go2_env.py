@@ -325,13 +325,14 @@ class Go2Env:
         
         # 追加（速度追従平均二乗誤差のグラフ）
         # 誤差ログの記録
-        for key in self.episode_error_sums.keys():
-            # 平均誤差を計算して "error_○○" という名前で登録
-            self.extras["episode"]["error_" + key] = (
-                torch.mean(self.episode_error_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
-            )
-            # バケツを空にする
-            self.episode_error_sums[key][envs_idx] = 0.0
+        if not hasattr(self, "episode_error_sums"):
+            for key in self.episode_error_sums.keys():
+                # 平均誤差を計算して "error_○○" という名前で登録
+                self.extras["episode"]["error_" + key] = (
+                    torch.mean(self.episode_error_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
+                )
+                # バケツを空にする
+                self.episode_error_sums[key][envs_idx] = 0.0
 
         self._sample_commands(envs_idx)
         
