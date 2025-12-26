@@ -120,10 +120,10 @@ def get_cfgs():
         "jump_upward_velocity": 1.2,  
         "jump_reward_steps": 50,
         "reward_scales": {
-            "tracking_lin_vel": 3.0,      
-            "tracking_ang_vel": 0.2,
+            "tracking_lin_vel": 1.0,      
+            "tracking_ang_vel": 0.5,
             "lin_vel_z": -2.0,
-            "base_height": -50.0,
+            "base_height": 0.0,
             #"base_height": -1.0,
             #"action_rate": -0.002,
             "action_rate": -0.01,
