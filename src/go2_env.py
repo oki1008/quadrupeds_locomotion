@@ -260,6 +260,11 @@ class Go2Env:
         self.commands[:, 4] = 0.0
 
         #追加(速度追従平均二乗誤差のグラフ)
+        #エラー回避
+        if not hasattr(self, "episode_error_sums"):
+            self.episode_error_sums = dict()
+            self.episode_error_sums["vel_xy"]  = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
+            self.episode_error_sums["vel_yaw"] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
         #誤差を計算してバケツ（辞書）に足す
         # 1. 速度(XY)のズレの二乗
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
