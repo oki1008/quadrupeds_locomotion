@@ -141,6 +141,12 @@ class Go2Env:
         self.jump_target_height = torch.zeros((self.num_envs,), device=self.device)
         
         self.extras = dict()  # extra information for logging
+        
+        #追加(速度追従平均二乗誤差のグラフ)
+        self.episode_error_sums = {
+            "vel_xy": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
+            "vel_yaw": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
+        }
 
     def _resample_commands(self, envs_idx):
         # self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
@@ -261,7 +267,7 @@ class Go2Env:
 
         #追加(速度追従平均二乗誤差のグラフ)
         #エラー回避
-        if not hasattr(self, "episode_error_sums"):
+        if  hasattr(self, "episode_error_sums"):
             self.episode_error_sums = dict()
             self.episode_error_sums["vel_xy"]  = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
             self.episode_error_sums["vel_yaw"] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)

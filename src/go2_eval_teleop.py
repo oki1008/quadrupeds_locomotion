@@ -68,7 +68,7 @@ def on_release(key):
 def main():
     global lin_x, lin_y, ang_z, base_height, toggle_jump, jump_height, stop
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="go2-walking")
+    parser.add_argument("-e", "--exp_name", type=str, default="go2_test")
     parser.add_argument("--ckpt", type=int, default=900)
     parser.add_argument("--save-data", type=bool, default=False)
     args = parser.parse_args()

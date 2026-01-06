@@ -122,7 +122,7 @@ def get_cfgs():
         "reward_scales": {
             "tracking_lin_vel": 1.0,      
             "tracking_ang_vel": 0.5,
-            "lin_vel_z": -2.0,
+            "lin_vel_z": -1.0,
             "base_height": 0.0,
             #"base_height": -1.0,
             #"action_rate": -0.002,
