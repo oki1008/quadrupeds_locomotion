@@ -148,6 +148,24 @@ class Go2Env:
             "vel_yaw": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
         }
 
+        #履歴設定の追加
+        # 過去何フレーム分をAIに見せるか (通常3〜5フレーム)
+        self.num_history_stack = 3 
+        
+        # 1フレームあたりの観測サイズ (今のobs_bufのサイズと同じにする必要があります)
+        # ang_vel(3) + gravity(3) + commands(5) + dof_pos(12) + dof_vel(12) + actions(12) + jump(1) = 48
+        self.num_raw_obs = 48 
+
+        # AIへの入力総数を上書き (例: 48 * 3 = 144次元)
+        self.num_obs = self.num_raw_obs * self.num_history_stack
+
+        # 履歴用バッファ [環境数, 履歴数, 生データ数]
+        self.obs_history_buf = torch.zeros(
+            (self.num_envs, self.num_history_stack, self.num_raw_obs), 
+            device=self.device, 
+            dtype=gs.tc_float
+        )
+
     def _resample_commands(self, envs_idx):
         # self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
         # self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
@@ -246,7 +264,24 @@ class Go2Env:
             self.episode_sums[name] += rew
 
         # compute observations
-        self.obs_buf = torch.cat(
+        # self.obs_buf = torch.cat(
+        #     [
+        #         self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
+        #         self.projected_gravity,  # 3
+        #         self.commands * self.commands_scale,  # 5
+        #         (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
+        #         self.dof_vel * self.obs_scales["dof_vel"],  # 12
+        #         self.actions,  # 12
+        #         (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),  # 1
+        #     ],
+        #     axis=-1,
+        # )
+
+        # compute observations
+        
+        # ======= 【ここから書き換え】 =======
+        # 1. まず「今この瞬間」の観測データを作る (変数名を raw_obs に変更)
+        raw_obs = torch.cat(
             [
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
                 self.projected_gravity,  # 3
@@ -259,6 +294,16 @@ class Go2Env:
             axis=-1,
         )
 
+        # 2. 履歴バッファを更新 (トコロテン方式)
+        # [t-1, t-2, t-3] を1つ後ろにずらす
+        self.obs_history_buf = torch.roll(self.obs_history_buf, shifts=1, dims=1)
+        # 先頭 [0] に最新の観測を入れる
+        self.obs_history_buf[:, 0] = raw_obs
+
+        # 3. AIに渡すために平らにする (例: [env, 3, 48] -> [env, 144])
+        self.obs_buf = self.obs_history_buf.view(self.num_envs, -1)
+        
+
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
         
@@ -267,7 +312,7 @@ class Go2Env:
 
         #追加(速度追従平均二乗誤差のグラフ)
         #エラー回避
-        if  hasattr(self, "episode_error_sums"):
+        if  not hasattr(self, "episode_error_sums"):
             self.episode_error_sums = dict()
             self.episode_error_sums["vel_xy"]  = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
             self.episode_error_sums["vel_yaw"] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
@@ -320,6 +365,10 @@ class Go2Env:
         self.jump_toggled_buf[envs_idx] = 0.0
         self.jump_target_height[envs_idx] = 0.0
 
+        #追加
+        # リセットされた環境の履歴をクリアする
+        self.obs_history_buf[envs_idx] = 0.0
+
         # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
@@ -331,7 +380,7 @@ class Go2Env:
         
         # 追加（速度追従平均二乗誤差のグラフ）
         # 誤差ログの記録
-        if not hasattr(self, "episode_error_sums"):
+        if hasattr(self, "episode_error_sums"):
             for key in self.episode_error_sums.keys():
                 # 平均誤差を計算して "error_○○" という名前で登録
                 self.extras["episode"]["error_" + key] = (
