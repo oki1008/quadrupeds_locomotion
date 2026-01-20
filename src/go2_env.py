@@ -156,12 +156,29 @@ class Go2Env:
         # ang_vel(3) + gravity(3) + commands(5) + dof_pos(12) + dof_vel(12) + actions(12) + jump(1) = 48
         self.num_raw_obs = 48 
 
-        # AIへの入力総数を上書き (例: 48 * 3 = 144次元)
-        self.num_obs = self.num_raw_obs * self.num_history_stack
+        # # AIへの入力総数を上書き (例: 48 * 3 = 144次元)
+        # self.num_obs = self.num_raw_obs * self.num_history_stack
 
-        # 履歴用バッファ [環境数, 履歴数, 生データ数]
+        # # 履歴用バッファ [環境数, 履歴数, 生データ数]
+        # self.obs_history_buf = torch.zeros(
+        #     (self.num_envs, self.num_history_stack, self.num_raw_obs), 
+        #     device=self.device, 
+        #     dtype=gs.tc_float
+        # )
+
+        # 1. 履歴 (History) の設定
+        self.num_history = 3   # 過去3フレーム分を見る
+        self.num_raw_obs = 48  # 1フレームあたりのデータ量
+        
+        # AIへの入力サイズを上書き (例: 48 * 3 = 144)
+        self.num_obs = self.num_raw_obs * self.num_history
+        
+        # 【重要】観測バッファも新しいサイズ(144)で作り直す！
+        self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
+
+        # 履歴を保存するバッファ [環境数, 3, 48]
         self.obs_history_buf = torch.zeros(
-            (self.num_envs, self.num_history_stack, self.num_raw_obs), 
+            (self.num_envs, self.num_history, self.num_raw_obs), 
             device=self.device, 
             dtype=gs.tc_float
         )
