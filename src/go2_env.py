@@ -2,6 +2,7 @@ import random
 import torch
 import math
 import genesis as gs
+import torch.nn.functional as F
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
 
@@ -42,7 +43,7 @@ class Go2Env:
 
         # create scene
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
+            sim_options=gs.options.SimOptions(dt=self.dt, substeps=30),
             viewer_options=gs.options.ViewerOptions(
                 max_FPS=int(0.5 / self.dt),
                 camera_pos=(3.5, 0.5, 2.5),
@@ -60,8 +61,52 @@ class Go2Env:
         )
 
         # add plain
-        self.scene.add_entity(gs.morphs.URDF(file="urdf/plane/plane.urdf", fixed=True))
+# 【学習本番用】滑らかな不整地 (Smooth Rough Terrain)
+        # =========================================================
+        
+        # 1. 設定
+        terrain_width = 20.0   
+        terrain_length = 20.0 
+        horizontal_scale = 0.05 
+        
+        n_rows = int(terrain_width / horizontal_scale)
+        n_cols = int(terrain_length / horizontal_scale)
+        
+        # 2. ランダムノイズ生成
+        seed_resolution = 20 
+        small_noise = torch.rand((1, 1, seed_resolution, seed_resolution), device=self.device)
+        
+        # 3. 引き伸ばして滑らかにする (Bilinear補間)
+        large_noise = F.interpolate(
+            small_noise, 
+            size=(n_rows, n_cols), 
+            mode='bilinear', 
+            align_corners=False
+        )
+        large_noise = large_noise.squeeze()
 
+        # 4. 高さ調整 (最初は 0.10m = 10cm くらいがおすすめ！)
+        terrain_height_scale = 0.10 
+        height_field_raw = large_noise * terrain_height_scale
+        
+        # 5. 【重要】スタート地点を平地にする (埋まり防止策)
+        center_x, center_y = n_rows // 2, n_cols // 2
+        flat_radius = 20 # 半径約1mは平らにする
+        height_field_raw[center_x-flat_radius:center_x+flat_radius, center_y-flat_radius:center_y+flat_radius] = 0.0
+
+        self.terrain_height_field = height_field_raw.cpu().numpy()
+
+        # 6. Genesisに追加
+        self.terrain = self.scene.add_entity(
+            gs.morphs.Terrain(
+                height_field=self.terrain_height_field,
+                horizontal_scale=horizontal_scale,
+                vertical_scale=1.0, 
+                pos=(0.0, 0.0, 0.0),
+            )
+        )
+        # =========================================================
+        # +++++++++ここまで++++++++++
         # add robot
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=self.device)
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=self.device)
@@ -131,6 +176,23 @@ class Go2Env:
         self.last_dof_vel = torch.zeros_like(self.actions)
         self.base_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+        # ======= 【追加】足の定義とタイマーの準備 =======
+     # Go2の足先リンクの名前を探してインデックスを取得
+        self.feet_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
+        
+        # ======= 【修正】ローカルインデックスの取得 =======
+        # グローバル番号(.idx)ではなく、ロボット専用の配列番号を取得してTensor化する
+        link_names = [link.name for link in self.robot.links]
+        self.feet_indices = torch.tensor(
+            [link_names.index(name) for name in self.feet_names],
+            device=self.device, 
+            dtype=torch.long
+        )
+        
+        # 滞空時間を計測するためのバッファ
+        self.feet_air_time = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+        self.last_contacts = torch.zeros((self.num_envs, 4), device=self.device, dtype=bool)
+        # ============================================
         self.default_dof_pos = torch.tensor(
             [self.env_cfg["default_joint_angles"][name] for name in self.env_cfg["dof_names"]],
             device=self.device,
@@ -221,8 +283,27 @@ class Go2Env:
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
         self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
+        #シミュレーションを1ステップ進める
         self.scene.step()
+# ======= 【修正版】足の接地判定と滞空時間の更新 =======
+        # 1. ロボットの全リンクの力を一括取得
+        # ※ 注意: メソッド名は "force" (単数形) です！
+        all_forces = self.robot.get_links_net_contact_force()
+        
+        # 2. 足のインデックス (self.feet_indices) を使って、4本の足の力だけ抜き出す
+        # forcesの形は [env数, 足の数(4), 3(xyz)] になります
+        forces = all_forces[:, self.feet_indices, :]
 
+        # 3. 接地判定 (力の大きさが0.1より大きければ接地)
+        contacts = torch.norm(forces, dim=-1) > 0.1
+        
+        # 4. 滞空時間のカウントアップ
+        self.feet_air_time += self.dt
+        
+        # 5. 接地した瞬間、タイマーをリセット
+        self.feet_air_time[contacts] = 0.0
+        
+        self.last_contacts = contacts
         # update buffers
         self.episode_length_buf += 1
         self.base_pos[:] = self.robot.get_pos()
@@ -266,6 +347,9 @@ class Go2Env:
         self.reset_buf = self.episode_length_buf > self.max_episode_length
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        
+        # 胴体の高さ(Z)が0.15mを下回ったら「転倒・落下」とみなして即リセット
+        self.reset_buf |= self.base_pos[:, 2] < 0.25
 
         time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
         self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=self.device, dtype=gs.tc_float)
@@ -366,7 +450,15 @@ class Go2Env:
         )
 
         # reset base
-        self.base_pos[envs_idx] = self.base_init_pos
+        # self.base_pos[envs_idx] = self.base_init_pos
+        #ロボットを最初にスポーンさせる位置
+        self.base_pos[envs_idx, 0] = 2.0+gs_rand_float(-0.5, 0.5, (len(envs_idx),), self.device)
+        self.base_pos[envs_idx, 1] = 2.0+gs_rand_float(-0.5, 0.5, (len(envs_idx),), self.device)
+        
+        # 2. 高さを少し下げて着地の衝撃を和らげる
+        # 平地なので0.45m（直立より少しだけ高い位置）で十分です
+        self.base_pos[envs_idx, 2] = 0.45
+
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
         self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
         self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
@@ -381,6 +473,9 @@ class Go2Env:
         self.reset_buf[envs_idx] = True
         self.jump_toggled_buf[envs_idx] = 0.0
         self.jump_target_height[envs_idx] = 0.0
+        ##追加
+        self.feet_air_time[envs_idx] = 0.0
+        self.last_contacts[envs_idx] = False
 
         #追加
         # リセットされた環境の履歴をクリアする
@@ -517,3 +612,8 @@ class Go2Env:
         mask = (self.jump_toggled_buf >= 0.6 * self.reward_cfg["jump_reward_steps"])
         height_error = -torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
         return mask.float() * height_error 
+
+    def _reward_feet_air_time(self):
+        # 滞空時間が長くなるほど報酬を与える
+        # これにより、ロボットは足を大きく上げるようになる
+        return torch.sum(self.feet_air_time, dim=1)

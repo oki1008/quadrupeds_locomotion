@@ -92,8 +92,8 @@ def get_cfgs():
         "kp": 20.0,
         "kd": 0.5,
         # termination
-        "termination_if_roll_greater_than": 30,  # degree
-        "termination_if_pitch_greater_than": 30,
+        "termination_if_roll_greater_than": 0.6,  # degree→rad
+        "termination_if_pitch_greater_than": 0.6,  # degree→rad
         # base pose
         "base_init_pos": [0.0, 0.0, 0.42],
         "base_init_quat": [1.0, 0.0, 0.0, 0.0],
@@ -104,7 +104,7 @@ def get_cfgs():
         "clip_actions": 100.0,
     }
     obs_cfg = {
-        "num_obs": 48,
+        "num_obs": 144, #48
         "obs_scales": {
             "lin_vel": 2.0,
             "ang_vel": 0.25,
@@ -119,15 +119,16 @@ def get_cfgs():
         "feet_height_target": 0.075,
         "jump_upward_velocity": 1.2,  
         "jump_reward_steps": 50,
+
+        ##主な報酬関数の重み付け
         "reward_scales": {
-            "tracking_lin_vel": 1.0,      
+            "tracking_lin_vel": 2.0,      
             "tracking_ang_vel": 0.5,
-            "lin_vel_z": -1.0,
+            "lin_vel_z": -0.5,
             "base_height": 0.0,
-            #"base_height": -1.0,
-            #"action_rate": -0.002,
-            "action_rate": -0.01,
-            "similar_to_default": -0.1,
+            "action_rate": -0.002,
+            "similar_to_default": -0.01,
+            "feet_air_time": 2.0,
             # "jump": 4.0,
             #"jump_height_tracking": 0.5,
             #"jump_height_achievement": 2.0,
@@ -143,7 +144,7 @@ def get_cfgs():
         # "lin_vel_x_range": [0.0, 0.0],
         # "lin_vel_y_range": [0.0, 0.0],
         # "ang_vel_range": [0.0, 0.0],
-        "height_range": [0.2, 0.4],
+        "height_range": [0.28, 0.38],
         #"jump_range": [0.5, 1.5],
         "jump_range": [0.0, 0.0],
     }
