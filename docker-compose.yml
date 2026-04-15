@@ -1,0 +1,19 @@
+services:
+  genesis:
+    build: .
+    container_name: genesis_argo_container
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - .:/workspace
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, compute, utility, graphics]
+    network_mode: host
+    ipc: host
+    command: sleep infinity

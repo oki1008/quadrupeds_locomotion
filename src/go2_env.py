@@ -96,6 +96,14 @@ class Go2Env:
 
         self.terrain_height_field = height_field_raw.cpu().numpy()
 
+        
+        # ======= 【追加】LiDAR計算用に地形の情報を保存 =======
+        self.height_field_tensor = height_field_raw  # GPU上の高さデータ
+        self.horizontal_scale = horizontal_scale
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        # ====================================================
+
         # 6. Genesisに追加
         self.terrain = self.scene.add_entity(
             gs.morphs.Terrain(
@@ -228,6 +236,20 @@ class Go2Env:
         #     dtype=gs.tc_float
         # )
 
+        # ======= 【追加】LiDAR（地形スキャン）の網目設定 =======
+        # ロボットを中心とした 11x11 の網目（グリッド）を作成
+        measure_points_x = torch.linspace(-0.8, 0.8, 11, device=self.device) # 前後
+        measure_points_y = torch.linspace(-0.5, 0.5, 11, device=self.device) # 左右
+        grid_x, grid_y = torch.meshgrid(measure_points_x, measure_points_y, indexing='ij')
+
+        self.num_height_points = grid_x.numel() # 11 x 11 = 121ポイント
+        
+        # グリッドのローカル座標系（ロボットから見た相対的な位置XY）
+        self.local_height_points = torch.zeros((self.num_envs, self.num_height_points, 3), device=self.device)
+        self.local_height_points[:, :, 0] = grid_x.flatten()
+        self.local_height_points[:, :, 1] = grid_y.flatten()
+        #############################################################
+
         # 1. 履歴 (History) の設定
         self.num_history = 3   # 過去3フレーム分を見る
         self.num_raw_obs = 48  # 1フレームあたりのデータ量
@@ -277,7 +299,35 @@ class Go2Env:
     
     def _sample_jump_commands(self, envs_idx):
         self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["jump_range"], (len(envs_idx),), self.device)
+
+
+    #LiDARの高さ測定関数
+    def _get_heights(self):
+        # 1. ロボットの現在の向き（Yaw角）を取得
+        yaw = self.base_euler[:, 2]
+        cos_yaw = torch.cos(yaw).unsqueeze(1)
+        sin_yaw = torch.sin(yaw).unsqueeze(1)
+
+        # 2. ロボット中心の網目を、ワールド座標（実際の地球上の位置）に変換
+        x = (self.local_height_points[:, :, 0] * cos_yaw - self.local_height_points[:, :, 1] * sin_yaw) + self.base_pos[:, 0].unsqueeze(1)
+        y = (self.local_height_points[:, :, 0] * sin_yaw + self.local_height_points[:, :, 1] * cos_yaw) + self.base_pos[:, 1].unsqueeze(1)
+
+        # 3. 座標から、地形データの「配列のインデックス」を計算
+        px = ((x + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long()
+        py = ((y + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long()
+
+        # はみ出さないように制限（マップの端っこ対策）
+        px = torch.clip(px, 0, self.n_rows - 1)
+        py = torch.clip(py, 0, self.n_cols - 1)
+
+        # 4. 地形データから高さを抜き出す
+        heights = self.height_field_tensor[px, py]
+
+        # 5. 「ロボットのお腹の高さ」との差分を計算（AIには相対的な高さを教えます）
+        relative_heights = heights - self.base_pos[:, 2].unsqueeze(1)
         
+        return relative_heights
+       
     def step(self, actions, is_train=True):
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
@@ -381,6 +431,8 @@ class Go2Env:
         # compute observations
         
         # ======= 【ここから書き換え】 =======
+        # ★新しくLiDARで地形の高さを取得！
+        measured_heights = self._get_heights()
         # 1. まず「今この瞬間」の観測データを作る (変数名を raw_obs に変更)
         raw_obs = torch.cat(
             [

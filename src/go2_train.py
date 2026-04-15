@@ -104,12 +104,13 @@ def get_cfgs():
         "clip_actions": 100.0,
     }
     obs_cfg = {
-        "num_obs": 144, #48
+        "num_obs": 507, #48
         "obs_scales": {
             "lin_vel": 2.0,
             "ang_vel": 0.25,
             "dof_pos": 1.0,
             "dof_vel": 0.05,
+            "height_measurements": 5.0,
         },
     }
     
@@ -122,13 +123,13 @@ def get_cfgs():
 
         ##主な報酬関数の重み付け
         "reward_scales": {
-            "tracking_lin_vel": 2.0,      
-            "tracking_ang_vel": 0.5,
-            "lin_vel_z": -0.5,
-            "base_height": 0.0,
-            "action_rate": -0.002,
+            "tracking_lin_vel": 1.0,      
+            "tracking_ang_vel": 0.2,
+            "lin_vel_z": -1.0,
+            "base_height": -1.0,
+            "action_rate": -0.005,
             "similar_to_default": -0.01,
-            "feet_air_time": 2.0,
+            "feet_air_time": 0.2
             # "jump": 4.0,
             #"jump_height_tracking": 0.5,
             #"jump_height_achievement": 2.0,
