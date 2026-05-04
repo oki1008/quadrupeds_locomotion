@@ -136,3 +136,9 @@ logs
 mujoco-3*
 *.zip
 *.pkl
+
+.codex/
+.vscode/
+logs/
+*.pt
+.codex

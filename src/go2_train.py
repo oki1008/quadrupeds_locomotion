@@ -3,6 +3,7 @@ import os
 import argparse
 import pickle
 import shutil
+import torch
 from go2_env import Go2Env
 from rsl_rl.runners import OnPolicyRunner
 
@@ -101,7 +102,15 @@ def get_cfgs():
         "resampling_time_s": 4.0,
         "action_scale": 0.25,
         "simulate_action_latency": True,
-        "clip_actions": 100.0,
+        "clip_actions": 2.0,
+        "target_dof_pos_clip": 0.8,
+        "sim_substeps": 4,
+        "terrain_step_width": 0.35,
+        "terrain_step_height": 0.03,
+        "spawn_xy_range": 3.0,
+        "spawn_height_offset": 0.65,
+        "termination_min_height": 0.12,
+        "termination_max_height": 1.2,
     }
     obs_cfg = {
         "num_obs": 507, #48
@@ -152,6 +161,14 @@ def get_cfgs():
     return env_cfg, obs_cfg, reward_cfg, command_cfg
 
 
+def resolve_device(requested_device):
+    requested_device = requested_device.lower()
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        print("[go2_train] CUDA was requested but is not available in this container. Falling back to CPU.")
+        return "cpu"
+    return requested_device
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="go2_test")
@@ -160,12 +177,17 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0", help="device to use: 'cpu' or 'cuda:0'")
     args = parser.parse_args()
 
-    backend = gs.constants.backend.gpu if args.device.lower() == "cuda:0" else gs.constants.backend.cpu
+    effective_device = resolve_device(args.device)
+    backend = gs.constants.backend.gpu if effective_device.startswith("cuda") else gs.constants.backend.cpu
     gs.init(logging_level="warning", backend=backend)
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
     train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
+
+    if effective_device == "cpu" and args.num_envs == parser.get_default("num_envs"):
+        args.num_envs = 256
+        print("[go2_train] CPU execution detected. Reducing num_envs from 4096 to 256 for a usable training speed.")
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -177,10 +199,10 @@ def main():
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         command_cfg=command_cfg,
-        device=args.device,
+        device=effective_device,
     )
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir, device=args.device)
+    runner = OnPolicyRunner(env, train_cfg, log_dir, device=effective_device)
 
     #ここに続きから学習させたいファイルのパスを記入
     #unner.load("logs/go2-walking/model_400.pt")

@@ -21,6 +21,8 @@ def gs_additive(base, increment):
 
 class Go2Env:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False, device="cuda", add_camera = False):
+        if str(device).startswith("cuda") and not torch.cuda.is_available():
+            device = "cpu"
         self.device = torch.device(device)
 
         self.num_envs = num_envs
@@ -29,8 +31,10 @@ class Go2Env:
         self.num_actions = env_cfg["num_actions"]
         self.num_commands = command_cfg["num_commands"]
 
-        self.simulate_action_latency = True  # there is a 1 step latency on real robot
-        self.dt = 0.02  # control frequency on real robot is 50hz
+        self.simulate_action_latency = env_cfg.get("simulate_action_latency", True)
+        self.dt = 0.02
+        self.sim_substeps = env_cfg.get("sim_substeps", 4)
+        self.rigid_dt = self.dt / self.sim_substeps
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
 
         self.env_cfg = env_cfg
@@ -43,7 +47,7 @@ class Go2Env:
 
         # create scene
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt, substeps=30),
+            sim_options=gs.options.SimOptions(dt=self.dt, substeps=self.sim_substeps),
             viewer_options=gs.options.ViewerOptions(
                 max_FPS=int(0.5 / self.dt),
                 camera_pos=(3.5, 0.5, 2.5),
@@ -52,7 +56,7 @@ class Go2Env:
             ),
             vis_options=gs.options.VisOptions(n_rendered_envs=num_envs, show_world_frame=False),
             rigid_options=gs.options.RigidOptions(
-                dt=self.dt,
+                dt=self.rigid_dt,
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
@@ -60,51 +64,43 @@ class Go2Env:
             show_viewer=show_viewer,
         )
 
-        # add plain
-# 【学習本番用】滑らかな不整地 (Smooth Rough Terrain)
-        # =========================================================
-        
-        # 1. 設定
-        terrain_width = 20.0   
-        terrain_length = 20.0 
+        # 【学習第1フェーズ】全方位階段（S字カーブを用いた絶対に爆発しない数学的階段）
+        terrain_width = 40.0   
+        terrain_length = 40.0 
         horizontal_scale = 0.05 
         
         n_rows = int(terrain_width / horizontal_scale)
         n_cols = int(terrain_length / horizontal_scale)
         
-        # 2. ランダムノイズ生成
-        seed_resolution = 20 
-        small_noise = torch.rand((1, 1, seed_resolution, seed_resolution), device=self.device)
-        
-        # 3. 引き伸ばして滑らかにする (Bilinear補間)
-        large_noise = F.interpolate(
-            small_noise, 
-            size=(n_rows, n_cols), 
-            mode='bilinear', 
-            align_corners=False
-        )
-        large_noise = large_noise.squeeze()
+        center_x = n_rows // 2
+        center_y = n_cols // 2
 
-        # 4. 高さ調整 (最初は 0.10m = 10cm くらいがおすすめ！)
-        terrain_height_scale = 0.10 
-        height_field_raw = large_noise * terrain_height_scale
-        
-        # 5. 【重要】スタート地点を平地にする (埋まり防止策)
-        center_x, center_y = n_rows // 2, n_cols // 2
-        flat_radius = 20 # 半径約1mは平らにする
-        height_field_raw[center_x-flat_radius:center_x+flat_radius, center_y-flat_radius:center_y+flat_radius] = 0.0
+        x = (torch.arange(n_rows, device=self.device) - center_x) * horizontal_scale
+        y = (torch.arange(n_cols, device=self.device) - center_y) * horizontal_scale
+        grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
 
+        r = torch.sqrt(grid_x**2 + grid_y**2)
+
+        step_width_m = self.env_cfg.get("terrain_step_width", 0.35)
+        step_height_m = self.env_cfg.get("terrain_step_height", 0.03)
+        
+        r_active = torch.clamp(r - 1.0, min=0.0)
+        rise_ratio = 0.5 
+        
+        step_idx = torch.floor(r_active / step_width_m)
+        t = (r_active % step_width_m) / step_width_m
+        
+        t_rise = torch.clamp((t - (1.0 - rise_ratio)) / rise_ratio, min=0.0, max=1.0)
+        smooth_rise = t_rise * t_rise * (3.0 - 2.0 * t_rise)
+        
+        height_field_raw = (step_idx + smooth_rise) * step_height_m
+
+        self.height_field_tensor = height_field_raw
         self.terrain_height_field = height_field_raw.cpu().numpy()
-
-        
-        # ======= 【追加】LiDAR計算用に地形の情報を保存 =======
-        self.height_field_tensor = height_field_raw  # GPU上の高さデータ
         self.horizontal_scale = horizontal_scale
         self.n_rows = n_rows
         self.n_cols = n_cols
-        # ====================================================
 
-        # 6. Genesisに追加
         self.terrain = self.scene.add_entity(
             gs.morphs.Terrain(
                 height_field=self.terrain_height_field,
@@ -113,8 +109,7 @@ class Go2Env:
                 pos=(0.0, 0.0, 0.0),
             )
         )
-        # =========================================================
-        # +++++++++ここまで++++++++++
+
         # add robot
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=self.device)
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=self.device)
@@ -127,7 +122,6 @@ class Go2Env:
             ),
         )
         
-        # self.cam_0 : gs.Camera = None
         if add_camera:
             self.cam_0 = self.scene.add_camera(
                 res=(1920, 1080),
@@ -137,30 +131,24 @@ class Go2Env:
                 GUI=True,
             )
 
-        # build
         self.scene.build(n_envs=num_envs, env_spacing=(1.0, 1.0))
 
-        # names to indices
         self.motor_dofs = [self.robot.get_joint(name).dof_idx_local for name in self.env_cfg["dof_names"]]
 
-        # PD control parameters
         self.robot.set_dofs_kp([self.env_cfg["kp"]] * self.num_actions, self.motor_dofs)
         self.robot.set_dofs_kv([self.env_cfg["kd"]] * self.num_actions, self.motor_dofs)
 
-        # prepare reward functions and multiply reward scales by dt
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
             self.reward_scales[name] *= self.dt
             self.reward_functions[name] = getattr(self, "_reward_" + name)
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
 
-            #追加（速度追従平均二乗誤差のグラフ）
-            #誤差を貯めるバケツ（辞書）を作る
-            self.episode_error_sums = dict()
-            self.episode_error_sums["vel_xy"]  = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
-            self.episode_error_sums["vel_yaw"] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
+        self.episode_error_sums = {
+            "vel_xy": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
+            "vel_yaw": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
+        }
 
-        # initialize buffers
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.projected_gravity = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
@@ -184,12 +172,8 @@ class Go2Env:
         self.last_dof_vel = torch.zeros_like(self.actions)
         self.base_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
-        # ======= 【追加】足の定義とタイマーの準備 =======
-     # Go2の足先リンクの名前を探してインデックスを取得
-        self.feet_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
         
-        # ======= 【修正】ローカルインデックスの取得 =======
-        # グローバル番号(.idx)ではなく、ロボット専用の配列番号を取得してTensor化する
+        self.feet_names = ["FL_calf", "FR_calf", "RL_calf", "RR_calf"]
         link_names = [link.name for link in self.robot.links]
         self.feet_indices = torch.tensor(
             [link_names.index(name) for name in self.feet_names],
@@ -197,10 +181,9 @@ class Go2Env:
             dtype=torch.long
         )
         
-        # 滞空時間を計測するためのバッファ
         self.feet_air_time = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
         self.last_contacts = torch.zeros((self.num_envs, 4), device=self.device, dtype=bool)
-        # ============================================
+        
         self.default_dof_pos = torch.tensor(
             [self.env_cfg["default_joint_angles"][name] for name in self.env_cfg["dof_names"]],
             device=self.device,
@@ -209,81 +192,31 @@ class Go2Env:
         
         self.jump_toggled_buf = torch.zeros((self.num_envs,), device=self.device)
         self.jump_target_height = torch.zeros((self.num_envs,), device=self.device)
-        
-        self.extras = dict()  # extra information for logging
-        
-        #追加(速度追従平均二乗誤差のグラフ)
-        self.episode_error_sums = {
-            "vel_xy": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
-            "vel_yaw": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
-        }
+        self.extras = dict()
 
-        #履歴設定の追加
-        # 過去何フレーム分をAIに見せるか (通常3〜5フレーム)
         self.num_history_stack = 3 
-        
-        # 1フレームあたりの観測サイズ (今のobs_bufのサイズと同じにする必要があります)
-        # ang_vel(3) + gravity(3) + commands(5) + dof_pos(12) + dof_vel(12) + actions(12) + jump(1) = 48
         self.num_raw_obs = 48 
 
-        # # AIへの入力総数を上書き (例: 48 * 3 = 144次元)
-        # self.num_obs = self.num_raw_obs * self.num_history_stack
-
-        # # 履歴用バッファ [環境数, 履歴数, 生データ数]
-        # self.obs_history_buf = torch.zeros(
-        #     (self.num_envs, self.num_history_stack, self.num_raw_obs), 
-        #     device=self.device, 
-        #     dtype=gs.tc_float
-        # )
-
-        # ======= 【追加】LiDAR（地形スキャン）の網目設定 =======
-        # ロボットを中心とした 11x11 の網目（グリッド）を作成
-        measure_points_x = torch.linspace(-0.8, 0.8, 11, device=self.device) # 前後
-        measure_points_y = torch.linspace(-0.5, 0.5, 11, device=self.device) # 左右
+        measure_points_x = torch.linspace(-0.8, 0.8, 11, device=self.device)
+        measure_points_y = torch.linspace(-0.5, 0.5, 11, device=self.device)
         grid_x, grid_y = torch.meshgrid(measure_points_x, measure_points_y, indexing='ij')
 
-        self.num_height_points = grid_x.numel() # 11 x 11 = 121ポイント
+        self.num_height_points = grid_x.numel()
         
-        # グリッドのローカル座標系（ロボットから見た相対的な位置XY）
         self.local_height_points = torch.zeros((self.num_envs, self.num_height_points, 3), device=self.device)
         self.local_height_points[:, :, 0] = grid_x.flatten()
         self.local_height_points[:, :, 1] = grid_y.flatten()
-        #############################################################
 
-        # 1. 履歴 (History) の設定
-        self.num_history = 3   # 過去3フレーム分を見る
-        self.num_raw_obs = 48  # 1フレームあたりのデータ量
-        
-        # AIへの入力サイズを上書き (例: 48 * 3 = 144)
+        self.num_history = 3
+        self.num_raw_obs = 48
         self.num_obs = self.num_raw_obs * self.num_history
-        
-        # 【重要】観測バッファも新しいサイズ(144)で作り直す！
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
-
-        # 履歴を保存するバッファ [環境数, 3, 48]
         self.obs_history_buf = torch.zeros(
             (self.num_envs, self.num_history, self.num_raw_obs), 
             device=self.device, 
             dtype=gs.tc_float
         )
 
-    def _resample_commands(self, envs_idx):
-        # self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
-        # self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
-        # self.commands[envs_idx, 2] = gs_rand_float(*self.command_cfg["ang_vel_range"], (len(envs_idx),), self.device)
-        # self.commands[envs_idx, 0] =  gs_additive(self.last_actions[envs_idx, 0], self.command_cfg["lin_vel_x_range"][0] + (self.command_cfg["lin_vel_x_range"][1] - self.command_cfg["lin_vel_x_range"][0]) * torch.sin(2 * math.pi * self.episode_length_buf[envs_idx] / 300))
-        self.commands[envs_idx, 0] =  gs_rand_gaussian(self.last_actions[envs_idx, 0], *self.command_cfg["lin_vel_x_range"],  2.0, (len(envs_idx),), self.device)
-        self.commands[envs_idx, 1] =  gs_rand_gaussian(self.last_actions[envs_idx, 1], *self.command_cfg["lin_vel_y_range"],  2.0, (len(envs_idx),), self.device)
-        self.commands[envs_idx, 2] =  gs_rand_gaussian(self.last_actions[envs_idx, 2], *self.command_cfg["ang_vel_range"],  2.0, (len(envs_idx),), self.device)
-        self.commands[envs_idx, 3] =  gs_rand_gaussian(self.last_actions[envs_idx, 3], *self.command_cfg["height_range"],  0.5,(len(envs_idx),), self.device)
-        self.commands[envs_idx, 4] = 0.0
-        
-        # scale lin_vel and ang_vel proportionally to the height difference between the target and default height
-        height_diff_scale = 0.5 + abs(self.commands[envs_idx, 3] - self.reward_cfg["base_height_target"])/ (self.command_cfg["height_range"][1] - self.reward_cfg["base_height_target"]) * 0.5
-        self.commands[envs_idx, 0] *= height_diff_scale
-        self.commands[envs_idx, 1] *= height_diff_scale
-        self.commands[envs_idx, 2] *= height_diff_scale
-        
     def _sample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 1] = gs_rand_float(*self.command_cfg["lin_vel_y_range"], (len(envs_idx),), self.device)
@@ -291,7 +224,6 @@ class Go2Env:
         self.commands[envs_idx, 3] = gs_rand_float(*self.command_cfg["height_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 4] = 0.0
         
-        # scale lin_vel and ang_vel proportionally to the height difference between the target and default height
         height_diff_scale = 0.5 + abs(self.commands[envs_idx, 3] - self.reward_cfg["base_height_target"])/ (self.command_cfg["height_range"][1] - self.reward_cfg["base_height_target"]) * 0.5
         self.commands[envs_idx, 0] *= height_diff_scale
         self.commands[envs_idx, 1] *= height_diff_scale
@@ -300,61 +232,45 @@ class Go2Env:
     def _sample_jump_commands(self, envs_idx):
         self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["jump_range"], (len(envs_idx),), self.device)
 
-
-    #LiDARの高さ測定関数
     def _get_heights(self):
-        # 1. ロボットの現在の向き（Yaw角）を取得
         yaw = self.base_euler[:, 2]
         cos_yaw = torch.cos(yaw).unsqueeze(1)
         sin_yaw = torch.sin(yaw).unsqueeze(1)
 
-        # 2. ロボット中心の網目を、ワールド座標（実際の地球上の位置）に変換
         x = (self.local_height_points[:, :, 0] * cos_yaw - self.local_height_points[:, :, 1] * sin_yaw) + self.base_pos[:, 0].unsqueeze(1)
         y = (self.local_height_points[:, :, 0] * sin_yaw + self.local_height_points[:, :, 1] * cos_yaw) + self.base_pos[:, 1].unsqueeze(1)
 
-        # 3. 座標から、地形データの「配列のインデックス」を計算
         px = ((x + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long()
         py = ((y + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long()
 
-        # はみ出さないように制限（マップの端っこ対策）
         px = torch.clip(px, 0, self.n_rows - 1)
         py = torch.clip(py, 0, self.n_cols - 1)
 
-        # 4. 地形データから高さを抜き出す
         heights = self.height_field_tensor[px, py]
-
-        # 5. 「ロボットのお腹の高さ」との差分を計算（AIには相対的な高さを教えます）
         relative_heights = heights - self.base_pos[:, 2].unsqueeze(1)
         
         return relative_heights
        
     def step(self, actions, is_train=True):
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        safe_actions = torch.clip(actions, -2.0, 2.0)
+        self.actions = torch.clip(safe_actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+        joint_clip = self.env_cfg.get("target_dof_pos_clip", 0.8)
+        target_dof_pos = torch.clip(target_dof_pos, self.default_dof_pos - joint_clip, self.default_dof_pos + joint_clip)
         self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
-        #シミュレーションを1ステップ進める
         self.scene.step()
-# ======= 【修正版】足の接地判定と滞空時間の更新 =======
-        # 1. ロボットの全リンクの力を一括取得
-        # ※ 注意: メソッド名は "force" (単数形) です！
-        all_forces = self.robot.get_links_net_contact_force()
         
-        # 2. 足のインデックス (self.feet_indices) を使って、4本の足の力だけ抜き出す
-        # forcesの形は [env数, 足の数(4), 3(xyz)] になります
+        all_forces = self.robot.get_links_net_contact_force()
         forces = all_forces[:, self.feet_indices, :]
 
-        # 3. 接地判定 (力の大きさが0.1より大きければ接地)
         contacts = torch.norm(forces, dim=-1) > 0.1
         
-        # 4. 滞空時間のカウントアップ
         self.feet_air_time += self.dt
-        
-        # 5. 接地した瞬間、タイマーをリセット
         self.feet_air_time[contacts] = 0.0
-        
         self.last_contacts = contacts
-        # update buffers
+        
         self.episode_length_buf += 1
         self.base_pos[:] = self.robot.get_pos()
         self.base_quat[:] = self.robot.get_quat()
@@ -368,38 +284,34 @@ class Go2Env:
         self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
         self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
 
-        # resample commands, it is a variable that holds the indices of environments that need to be resampled or reset. 
         envs_idx = (
             (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
             .nonzero(as_tuple=False)
             .flatten()
         )
         if is_train:
-            # self._resample_commands(all_envs_idx)
             self._sample_commands(envs_idx)
-            # Idxs with probability of 5% to sample random commands
             ranomd_idxs_1 = torch.randperm(self.num_envs)[:int(self.num_envs * 0.05)]
             self._sample_commands(ranomd_idxs_1)
             
-            random_idxs_2 = torch.randperm(self.num_envs)[:int(self.num_envs * 0.05)]
-            self._sample_jump_commands(random_idxs_2)
-            
-        # Update jump_toggled_buf if command 4 goes from 0 -> non-zero
         jump_cmd_now = (self.commands[:, 4] > 0.0).float()
         toggle_mask = ((self.jump_toggled_buf == 0.0) & (jump_cmd_now > 0.0)).float()
-        self.jump_toggled_buf += toggle_mask * self.reward_cfg["jump_reward_steps"]  # stay 'active' for n steps, for example
+        self.jump_toggled_buf += toggle_mask * self.reward_cfg["jump_reward_steps"]
         self.jump_toggled_buf = torch.clamp(self.jump_toggled_buf - 1.0, min=0.0)
-        # Update jump_target_height if command 4 goes from 0 -> non-zero
         self.jump_target_height = torch.where(jump_cmd_now > 0.0, self.commands[:, 4], self.jump_target_height)
         
-        # print(f'jump_toggled_buf: {self.jump_toggled_buf}, jump_target_height: {self.jump_target_height}, commands: {self.commands}')
-        # check termination and reset
         self.reset_buf = self.episode_length_buf > self.max_episode_length
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
-        
-        # 胴体の高さ(Z)が0.15mを下回ったら「転倒・落下」とみなして即リセット
-        self.reset_buf |= self.base_pos[:, 2] < 0.25
+
+        px_reset = torch.clip(((self.base_pos[:, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
+        py_reset = torch.clip(((self.base_pos[:, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
+        ground_height_reset = self.height_field_tensor[px_reset, py_reset]
+        local_height = self.base_pos[:, 2] - ground_height_reset
+
+        # 🌟【重要修正1】着地の沈み込みで即死しないよう、0.20 から 0.10 に変更
+        self.reset_buf |= local_height < self.env_cfg.get("termination_min_height", 0.12)
+        self.reset_buf |= local_height > self.env_cfg.get("termination_max_height", 1.2)
 
         time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
         self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=self.device, dtype=gs.tc_float)
@@ -407,33 +319,12 @@ class Go2Env:
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())    
         
-        # compute reward
         self.rew_buf[:] = 0.0
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
 
-        # compute observations
-        # self.obs_buf = torch.cat(
-        #     [
-        #         self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
-        #         self.projected_gravity,  # 3
-        #         self.commands * self.commands_scale,  # 5
-        #         (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],  # 12
-        #         self.dof_vel * self.obs_scales["dof_vel"],  # 12
-        #         self.actions,  # 12
-        #         (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),  # 1
-        #     ],
-        #     axis=-1,
-        # )
-
-        # compute observations
-        
-        # ======= 【ここから書き換え】 =======
-        # ★新しくLiDARで地形の高さを取得！
-        measured_heights = self._get_heights()
-        # 1. まず「今この瞬間」の観測データを作る (変数名を raw_obs に変更)
         raw_obs = torch.cat(
             [
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
@@ -447,35 +338,17 @@ class Go2Env:
             axis=-1,
         )
 
-        # 2. 履歴バッファを更新 (トコロテン方式)
-        # [t-1, t-2, t-3] を1つ後ろにずらす
         self.obs_history_buf = torch.roll(self.obs_history_buf, shifts=1, dims=1)
-        # 先頭 [0] に最新の観測を入れる
         self.obs_history_buf[:, 0] = raw_obs
-
-        # 3. AIに渡すために平らにする (例: [env, 3, 48] -> [env, 144])
         self.obs_buf = self.obs_history_buf.view(self.num_envs, -1)
         
-
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
-        
-        # Reset jump command
         self.commands[:, 4] = 0.0
 
-        #追加(速度追従平均二乗誤差のグラフ)
-        #エラー回避
-        if  not hasattr(self, "episode_error_sums"):
-            self.episode_error_sums = dict()
-            self.episode_error_sums["vel_xy"]  = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
-            self.episode_error_sums["vel_yaw"] = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
-        #誤差を計算してバケツ（辞書）に足す
-        # 1. 速度(XY)のズレの二乗
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        # 2. 回転(Yaw)のズレの二乗
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
 
-        # 3. バッファに蓄積 (dtを掛けて積分)
         self.episode_error_sums["vel_xy"]  += lin_vel_error * self.dt
         self.episode_error_sums["vel_yaw"] += ang_vel_error * self.dt
 
@@ -491,7 +364,6 @@ class Go2Env:
         if len(envs_idx) == 0:
             return
 
-        # reset dofs
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
@@ -501,39 +373,35 @@ class Go2Env:
             envs_idx=envs_idx,
         )
 
-        # reset base
-        # self.base_pos[envs_idx] = self.base_init_pos
-        #ロボットを最初にスポーンさせる位置
-        self.base_pos[envs_idx, 0] = 2.0+gs_rand_float(-0.5, 0.5, (len(envs_idx),), self.device)
-        self.base_pos[envs_idx, 1] = 2.0+gs_rand_float(-0.5, 0.5, (len(envs_idx),), self.device)
+        spawn_xy_range = self.env_cfg.get("spawn_xy_range", 3.0)
+        self.base_pos[envs_idx, 0] = gs_rand_float(-spawn_xy_range, spawn_xy_range, (len(envs_idx),), self.device)
+        self.base_pos[envs_idx, 1] = gs_rand_float(-spawn_xy_range, spawn_xy_range, (len(envs_idx),), self.device)
         
-        # 2. 高さを少し下げて着地の衝撃を和らげる
-        # 平地なので0.45m（直立より少しだけ高い位置）で十分です
-        self.base_pos[envs_idx, 2] = 0.45
+        px = torch.clip(((self.base_pos[envs_idx, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
+        py = torch.clip(((self.base_pos[envs_idx, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
+        ground_heights = self.height_field_tensor[px, py]
+        
+        self.base_pos[envs_idx, 2] = ground_heights + self.env_cfg.get("spawn_height_offset", 0.65)
 
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
-        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
-        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
+        # 🌟【真犯人逮捕】テレポート時にロボットの落下スピードを完全にゼロ(True)にする！
+        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.base_lin_vel[envs_idx] = 0
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
 
-        # reset buffers
         self.last_actions[envs_idx] = 0.0
         self.last_dof_vel[envs_idx] = 0.0
         self.episode_length_buf[envs_idx] = 0
         self.reset_buf[envs_idx] = True
         self.jump_toggled_buf[envs_idx] = 0.0
         self.jump_target_height[envs_idx] = 0.0
-        ##追加
         self.feet_air_time[envs_idx] = 0.0
         self.last_contacts[envs_idx] = False
 
-        #追加
-        # リセットされた環境の履歴をクリアする
         self.obs_history_buf[envs_idx] = 0.0
 
-        # fill extras
         self.extras["episode"] = {}
         for key in self.episode_sums.keys():
             self.extras["episode"]["rew_" + key] = (
@@ -541,21 +409,13 @@ class Go2Env:
             )
             self.episode_sums[key][envs_idx] = 0.0
 
-        
-        # 追加（速度追従平均二乗誤差のグラフ）
-        # 誤差ログの記録
-        if hasattr(self, "episode_error_sums"):
-            for key in self.episode_error_sums.keys():
-                # 平均誤差を計算して "error_○○" という名前で登録
-                self.extras["episode"]["error_" + key] = (
-                    torch.mean(self.episode_error_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
-                )
-                # バケツを空にする
-                self.episode_error_sums[key][envs_idx] = 0.0
+        for key in self.episode_error_sums.keys():
+            self.extras["episode"]["error_" + key] = (
+                torch.mean(self.episode_error_sums[key][envs_idx]).item() / self.env_cfg["episode_length_s"]
+            )
+            self.episode_error_sums[key][envs_idx] = 0.0
 
         self._sample_commands(envs_idx)
-        
-        # set target height command to default height
         self.commands[envs_idx, 3] = self.reward_cfg["base_height_target"]
         
 
@@ -566,106 +426,34 @@ class Go2Env:
 
     # ------------ reward functions----------------
     def _reward_tracking_lin_vel(self):
-        # Tracking of linear velocity commands (xy axes)
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
         return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_tracking_ang_vel(self):
-        # Tracking of angular velocity commands (yaw)
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_lin_vel_z(self):
-        # Penalize z axis base linear velocity
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        return active_mask * torch.square(self.base_lin_vel[:, 2])
+        return active_mask * torch.square(self.base_lin_vel[:, 2]) * 0.1
 
     def _reward_action_rate(self):
-        # Penalize changes in actions
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        return active_mask * torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+        return active_mask * torch.sum(torch.square(self.last_actions - self.actions), dim=1) * 0.3
 
     def _reward_similar_to_default(self):
-        # Penalize joint poses far away from default pose
         active_mask = (self.jump_toggled_buf < 0.01).float()
         return active_mask * torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1)
 
     def _reward_base_height(self):
-        # Penalize base height away from target
-        # return torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        return active_mask * torch.square(self.base_pos[:, 2] - self.commands[:, 3])
-    
-    # def _reward_jump(self):
-    #     # Reward if jump_toggled_buf > 0, even if command is now 0
-    #     target_height = self.jump_target_height
-    #     # Reward is active if jump_toggled_buf is active and some steps have passed (in order to prepare for jump)
-    #     active_mask = (self.jump_toggled_buf > 0.0).float() * (self.jump_toggled_buf < (1.0/3.0 * self.reward_cfg["jump_reward_steps"])).float()
-    #     active_mask_speed = (self.jump_toggled_buf > 1.0/3.0 * self.reward_cfg["jump_reward_steps"]).float() * (self.jump_toggled_buf < (2.0/3.0 * self.reward_cfg["jump_reward_steps"])).float()
-    #     # Reward for reaching the target height
-    #     height_reward = torch.exp(-torch.square(self.base_pos[:, 2] - target_height))
         
-    #     # Reward for having a significant upward velocity
-    #     upward_velocity_reward = 5 * torch.exp(-torch.square(self.base_lin_vel[:, 2] - self.reward_cfg["jump_upward_velocity"]))
+        px = torch.clip(((self.base_pos[:, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
+        py = torch.clip(((self.base_pos[:, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
+        ground_heights = self.height_field_tensor[px, py]
         
-    #     stay_penalty = -torch.square(self.base_pos[:, 2] - target_height) * (self.jump_toggled_buf > (2.0/3.0 * self.reward_cfg["jump_reward_steps"])).float()
-
-    #     return active_mask * height_reward + active_mask_speed * upward_velocity_reward + stay_penalty * 0.1
-
-    # def _reward_jump(self):
-    #     target_height = self.jump_target_height
-        
-    #     # Target speed the robot should have to reach the target height in half the available time, considering the gravity (uniform acceleration)
-    #     delta_height = target_height - self.base_pos[:, 2]
-    #     available_time = self.reward_cfg["jump_reward_steps"] * self.dt * 0.6 * 0.5
-    #     target_speed = torch.sqrt(2 * torch.abs(delta_height) * 9.81) * torch.sign(delta_height)
-        
-    #     # Phase 2: near peak height
-    #     phase2_mask = (self.jump_toggled_buf >= (0.3 * self.reward_cfg["jump_reward_steps"])) & (self.jump_toggled_buf < (0.6 * self.reward_cfg["jump_reward_steps"]))
-    #     target_height_reward = torch.exp(-torch.square(self.base_pos[:, 2] - target_height))
-    #     # upward_speed_reward = torch.exp(-torch.square(self.base_lin_vel[:, 2] - target_speed))
-    #     upward_speed_reward = torch.exp(self.base_lin_vel[:, 2]) * 0.2
-    #     binary_reward_close_to_target = (torch.abs(self.base_pos[:, 2] - target_height) < 0.2).float() * 6.0
-
-        
-    #     # # Phase 1: descend
-    #     phase1_mask = (self.jump_toggled_buf >= (0.6 * self.reward_cfg["jump_reward_steps"]))
-    #     phase1_penalty = -torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
-
-    #     return (
-    #         phase2_mask.float() * (target_height_reward * 2 + upward_speed_reward + binary_reward_close_to_target) +
-    #         phase1_mask.float() * phase1_penalty * 0.08
-    #     )
-    
-    def _reward_jump_height_tracking(self):
-        """Continuous reward for minimizing distance to target height during peak phase"""
-        mask = ((self.jump_toggled_buf >= 0.3 * self.reward_cfg["jump_reward_steps"]) & 
-                (self.jump_toggled_buf < 0.6 * self.reward_cfg["jump_reward_steps"]))
-        target_height = self.jump_target_height
-        height_diff = torch.exp(-torch.square(self.base_pos[:, 2] - target_height))
-        return mask.float() * height_diff
-
-    def _reward_jump_height_achievement(self):
-        """Binary reward for reaching close to target height during peak phase"""
-        mask = ((self.jump_toggled_buf >= 0.3 * self.reward_cfg["jump_reward_steps"]) & 
-                (self.jump_toggled_buf < 0.6 * self.reward_cfg["jump_reward_steps"]))
-        target_height = self.jump_target_height
-        binary_bonus = (torch.abs(self.base_pos[:, 2] - target_height) < 0.2).float()
-        return mask.float() * binary_bonus
-
-    def _reward_jump_speed(self):
-        """Reward for upward velocity during peak phase"""
-        mask = ((self.jump_toggled_buf >= 0.3 * self.reward_cfg["jump_reward_steps"]) & 
-                (self.jump_toggled_buf < 0.6 * self.reward_cfg["jump_reward_steps"]))
-        return mask.float() * torch.exp(self.base_lin_vel[:, 2]) * 0.2
-
-    def _reward_jump_landing(self):
-        """Penalty for deviation from base height during landing"""
-        mask = (self.jump_toggled_buf >= 0.6 * self.reward_cfg["jump_reward_steps"])
-        height_error = -torch.square(self.base_pos[:, 2] - self.reward_cfg["base_height_target"])
-        return mask.float() * height_error 
+        local_base_height = self.base_pos[:, 2] - ground_heights
+        return active_mask * torch.square(local_base_height - self.commands[:, 3])
 
     def _reward_feet_air_time(self):
-        # 滞空時間が長くなるほど報酬を与える
-        # これにより、ロボットは足を大きく上げるようになる
-        return torch.sum(self.feet_air_time, dim=1)
+        return torch.sum(torch.clamp(self.feet_air_time, 0.0, 0.5), dim=1)
