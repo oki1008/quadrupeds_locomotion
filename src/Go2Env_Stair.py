@@ -19,11 +19,13 @@ def gs_additive(base, increment):
 
 
 
-class Go2Env:
+class Go2Env_Stair:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False, device="cuda", add_camera = False):
         if str(device).startswith("cuda") and not torch.cuda.is_available():
             device = "cpu"
         self.device = torch.device(device)
+
+        print(f"読み込むクラス: Go2Env_Stair")
 
         self.num_envs = num_envs
         self.num_obs = obs_cfg["num_obs"]

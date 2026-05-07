@@ -1,10 +1,11 @@
 
 import os
 import argparse
+import importlib
 import pickle
 import shutil
 import torch
-from go2_env import Go2Env
+import yaml
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
@@ -57,108 +58,17 @@ def get_train_cfg(exp_name, max_iterations):
     return train_cfg_dict
 
 
-def get_cfgs():
-    env_cfg = {
-        "num_actions": 12,
-        # joint/link names
-        "default_joint_angles": {  # [rad]
-            "FL_hip_joint": 0.0,
-            "FR_hip_joint": 0.0,
-            "RL_hip_joint": 0.0,
-            "RR_hip_joint": 0.0,
-            "FL_thigh_joint": 0.8,
-            "FR_thigh_joint": 0.8,
-            "RL_thigh_joint": 1.0,
-            "RR_thigh_joint": 1.0,
-            "FL_calf_joint": -1.5,
-            "FR_calf_joint": -1.5,
-            "RL_calf_joint": -1.5,
-            "RR_calf_joint": -1.5,
-        },
-        "dof_names": [
-            "FR_hip_joint",
-            "FR_thigh_joint",
-            "FR_calf_joint",
-            "FL_hip_joint",
-            "FL_thigh_joint",
-            "FL_calf_joint",
-            "RR_hip_joint",
-            "RR_thigh_joint",
-            "RR_calf_joint",
-            "RL_hip_joint",
-            "RL_thigh_joint",
-            "RL_calf_joint",
-        ],
-        # PD
-        "kp": 20.0,
-        "kd": 0.5,
-        # termination
-        "termination_if_roll_greater_than": 0.6,  # degree→rad
-        "termination_if_pitch_greater_than": 0.6,  # degree→rad
-        # base pose
-        "base_init_pos": [0.0, 0.0, 0.42],
-        "base_init_quat": [1.0, 0.0, 0.0, 0.0],
-        "episode_length_s": 20.0,
-        "resampling_time_s": 4.0,
-        "action_scale": 0.25,
-        "simulate_action_latency": True,
-        "clip_actions": 2.0,
-        "target_dof_pos_clip": 0.8,
-        "sim_substeps": 4,
-        "terrain_step_width": 0.35,
-        "terrain_step_height": 0.03,
-        "spawn_xy_range": 3.0,
-        "spawn_height_offset": 0.65,
-        "termination_min_height": 0.12,
-        "termination_max_height": 1.2,
-    }
-    obs_cfg = {
-        "num_obs": 507, #48
-        "obs_scales": {
-            "lin_vel": 2.0,
-            "ang_vel": 0.25,
-            "dof_pos": 1.0,
-            "dof_vel": 0.05,
-            "height_measurements": 5.0,
-        },
-    }
-    
-    reward_cfg = {
-        "tracking_sigma": 0.25,
-        "base_height_target": 0.3,
-        "feet_height_target": 0.075,
-        "jump_upward_velocity": 1.2,  
-        "jump_reward_steps": 50,
+def load_config(config_path):
+    """Load configuration from YAML file."""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config['env_cfg'], config['obs_cfg'], config['reward_cfg'], config['command_cfg'], config['train_cfg']
 
-        ##主な報酬関数の重み付け
-        "reward_scales": {
-            "tracking_lin_vel": 1.0,      
-            "tracking_ang_vel": 0.2,
-            "lin_vel_z": -1.0,
-            "base_height": -1.0,
-            "action_rate": -0.005,
-            "similar_to_default": -0.01,
-            "feet_air_time": 0.2
-            # "jump": 4.0,
-            #"jump_height_tracking": 0.5,
-            #"jump_height_achievement": 2.0,
-            #"jump_speed" : 1.0,
-            #"jump_landing": 0.08,
-        },
-    }
-    command_cfg = {
-        "num_commands": 5,  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
-        "lin_vel_x_range": [-1.0, 1.0],
-        "lin_vel_y_range": [-0.5, 0.5],
-        "ang_vel_range": [-0.6, 0.6],
-        # "lin_vel_x_range": [0.0, 0.0],
-        # "lin_vel_y_range": [0.0, 0.0],
-        # "ang_vel_range": [0.0, 0.0],
-        "height_range": [0.28, 0.38],
-        #"jump_range": [0.5, 1.5],
-        "jump_range": [0.0, 0.0],
-    }
-    return env_cfg, obs_cfg, reward_cfg, command_cfg
+
+def create_default_config(config_path):
+    raise NotImplementedError("Default config creation not implemented. Please create a config.yaml file based on the provided template.")
 
 
 def resolve_device(requested_device):
@@ -171,48 +81,63 @@ def resolve_device(requested_device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-e", "--exp_name", type=str, default="go2_test")
-    parser.add_argument("-B", "--num_envs", type=int, default=4096)
-    parser.add_argument("--max_iterations", type=int, default=10000)
-    parser.add_argument("--device", type=str, default="cuda:0", help="device to use: 'cpu' or 'cuda:0'")
+    parser.add_argument("--config", type=str, default="config.yaml", help="path to configuration YAML file")
     args = parser.parse_args()
 
-    effective_device = resolve_device(args.device)
+    if not os.path.exists(args.config):
+        print(f"Configuration file {args.config} not found. Creating default configuration.")
+        create_default_config(args.config)
+    env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = load_config(args.config)
+
+    exp_name = train_cfg["exp_name"]
+    num_envs = train_cfg["num_envs"]
+    max_iterations = train_cfg["max_iterations"]
+    env_name = train_cfg["env"]
+    device = train_cfg["device"]
+
+    effective_device = resolve_device(device)
     backend = gs.constants.backend.gpu if effective_device.startswith("cuda") else gs.constants.backend.cpu
     gs.init(logging_level="warning", backend=backend)
 
-    log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
-    train_cfg = get_train_cfg(args.exp_name, args.max_iterations)
+    log_dir = f"logs/{exp_name}"
+    train_cfg_full = get_train_cfg(exp_name, max_iterations)
 
-    if effective_device == "cpu" and args.num_envs == parser.get_default("num_envs"):
-        args.num_envs = 256
+    if effective_device == "cpu" and num_envs == 4096:
+        num_envs = 256
         print("[go2_train] CPU execution detected. Reducing num_envs from 4096 to 256 for a usable training speed.")
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
-    env = Go2Env(
-        num_envs=args.num_envs,
+    # Copy config file to log directory
+    shutil.copy(args.config, os.path.join(log_dir, "config.yaml"))
+
+    # Dynamically import the environment module and class
+    # Expects: file name == class name (e.g., Go2Env.py with Go2Env class)
+    env_module = importlib.import_module(env_name)
+    env_class = getattr(env_module, env_name)
+    env = env_class(
+        num_envs=num_envs,
         env_cfg=env_cfg,
         obs_cfg=obs_cfg,
         reward_cfg=reward_cfg,
         command_cfg=command_cfg,
         device=effective_device,
     )
+   
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir, device=effective_device)
+    runner = OnPolicyRunner(env, train_cfg_full, log_dir, device=effective_device)
 
     #ここに続きから学習させたいファイルのパスを記入
     #unner.load("logs/go2-walking/model_400.pt")
 
     pickle.dump(
-        [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg],
+        [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg_full],
         open(f"{log_dir}/cfgs.pkl", "wb"),
     )
 
-    runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=max_iterations, init_at_random_ep_len=True)
 
 
 if __name__ == "__main__":
