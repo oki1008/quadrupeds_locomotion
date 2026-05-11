@@ -1,23 +1,11 @@
-import random
 import torch
 import math
 import genesis as gs
-import torch.nn.functional as F
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
-
-def gs_rand_gaussian(mean, min, max, n_std, shape, device):
-    mean_tensor = mean.expand(shape).to(device)
-    std_tensor = torch.full(shape, (max - min)/ 4.0 * n_std, device=device)
-    return torch.clamp(torch.normal(mean_tensor, std_tensor), min, max)
-
-def gs_additive(base, increment):
-    return base + increment
-
-
 
 class Go2Env_Stair:
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False, device="cuda", add_camera = False):
@@ -66,10 +54,9 @@ class Go2Env_Stair:
             show_viewer=show_viewer,
         )
 
-        # 【学習第1フェーズ】全方位階段（S字カーブを用いた絶対に爆発しない数学的階段）
-        terrain_width = 40.0   
-        terrain_length = 40.0 
-        horizontal_scale = 0.05 
+        terrain_width = self.env_cfg.get("terrain_width", 8.0)
+        terrain_length = self.env_cfg.get("terrain_length", 12.0)
+        horizontal_scale = self.env_cfg.get("horizontal_scale", 0.05)
         
         n_rows = int(terrain_width / horizontal_scale)
         n_cols = int(terrain_length / horizontal_scale)
@@ -81,21 +68,16 @@ class Go2Env_Stair:
         y = (torch.arange(n_cols, device=self.device) - center_y) * horizontal_scale
         grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
 
-        r = torch.sqrt(grid_x**2 + grid_y**2)
-
         step_width_m = self.env_cfg.get("terrain_step_width", 0.35)
         step_height_m = self.env_cfg.get("terrain_step_height", 0.03)
-        
-        r_active = torch.clamp(r - 1.0, min=0.0)
-        rise_ratio = 0.5 
-        
-        step_idx = torch.floor(r_active / step_width_m)
-        t = (r_active % step_width_m) / step_width_m
-        
-        t_rise = torch.clamp((t - (1.0 - rise_ratio)) / rise_ratio, min=0.0, max=1.0)
-        smooth_rise = t_rise * t_rise * (3.0 - 2.0 * t_rise)
-        
-        height_field_raw = (step_idx + smooth_rise) * step_height_m
+        stair_start_x = self.env_cfg.get("stair_start_x", -1.0)
+        stair_end_x = self.env_cfg.get("stair_end_x", 4.0)
+        active_x = torch.clamp(grid_x - stair_start_x, min=0.0)
+        step_idx = torch.floor(active_x / step_width_m)
+        height_field_raw = step_idx * step_height_m
+        height_field_raw = torch.where(grid_x < stair_start_x, torch.zeros_like(height_field_raw), height_field_raw)
+        max_step_idx = math.floor(max(stair_end_x - stair_start_x, 0.0) / step_width_m)
+        height_field_raw = torch.clamp(height_field_raw, max=max_step_idx * step_height_m)
 
         self.height_field_tensor = height_field_raw
         self.terrain_height_field = height_field_raw.cpu().numpy()
@@ -108,7 +90,7 @@ class Go2Env_Stair:
                 height_field=self.terrain_height_field,
                 horizontal_scale=horizontal_scale,
                 vertical_scale=1.0, 
-                pos=(0.0, 0.0, 0.0),
+                pos=(-terrain_width / 2.0, -terrain_length / 2.0, 0.0),
             )
         )
 
@@ -151,6 +133,8 @@ class Go2Env_Stair:
             "vel_yaw": torch.zeros(self.num_envs, device=self.device, dtype=gs.tc_float),
         }
 
+        self.non_timeout_reset = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+        self.base_world_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.projected_gravity = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
@@ -196,9 +180,6 @@ class Go2Env_Stair:
         self.jump_target_height = torch.zeros((self.num_envs,), device=self.device)
         self.extras = dict()
 
-        self.num_history_stack = 3 
-        self.num_raw_obs = 48 
-
         measure_points_x = torch.linspace(-0.8, 0.8, 11, device=self.device)
         measure_points_y = torch.linspace(-0.5, 0.5, 11, device=self.device)
         grid_x, grid_y = torch.meshgrid(measure_points_x, measure_points_y, indexing='ij')
@@ -210,7 +191,7 @@ class Go2Env_Stair:
         self.local_height_points[:, :, 1] = grid_y.flatten()
 
         self.num_history = 3
-        self.num_raw_obs = 48
+        self.num_raw_obs = 48 + self.num_height_points
         self.num_obs = self.num_raw_obs * self.num_history
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
         self.obs_history_buf = torch.zeros(
@@ -251,7 +232,7 @@ class Go2Env_Stair:
         heights = self.height_field_tensor[px, py]
         relative_heights = heights - self.base_pos[:, 2].unsqueeze(1)
         
-        return relative_heights
+        return torch.clip(relative_heights * self.obs_scales["height_measurements"], -1.0, 1.0)
        
     def step(self, actions, is_train=True):
         safe_actions = torch.clip(actions, -2.0, 2.0)
@@ -280,7 +261,8 @@ class Go2Env_Stair:
             transform_quat_by_quat(torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat)
         )
         inv_base_quat = inv_quat(self.base_quat)
-        self.base_lin_vel[:] = transform_by_quat(self.robot.get_vel(), inv_base_quat)
+        self.base_world_lin_vel[:] = self.robot.get_vel()
+        self.base_lin_vel[:] = transform_by_quat(self.base_world_lin_vel, inv_base_quat)
         self.base_ang_vel[:] = transform_by_quat(self.robot.get_ang(), inv_base_quat)
         self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
         self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
@@ -302,30 +284,37 @@ class Go2Env_Stair:
         self.jump_toggled_buf = torch.clamp(self.jump_toggled_buf - 1.0, min=0.0)
         self.jump_target_height = torch.where(jump_cmd_now > 0.0, self.commands[:, 4], self.jump_target_height)
         
-        self.reset_buf = self.episode_length_buf > self.max_episode_length
-        self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
-        self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
-
         px_reset = torch.clip(((self.base_pos[:, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
         py_reset = torch.clip(((self.base_pos[:, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
         ground_height_reset = self.height_field_tensor[px_reset, py_reset]
         local_height = self.base_pos[:, 2] - ground_height_reset
 
-        # 🌟【重要修正1】着地の沈み込みで即死しないよう、0.20 から 0.10 に変更
-        self.reset_buf |= local_height < self.env_cfg.get("termination_min_height", 0.12)
-        self.reset_buf |= local_height > self.env_cfg.get("termination_max_height", 1.2)
+        timeout = self.episode_length_buf > self.max_episode_length
+        term_pitch = torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
+        term_roll = torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        term_low_height = local_height < self.env_cfg.get("termination_min_height", 0.12)
+        term_high_height = local_height > self.env_cfg.get("termination_max_height", 1.2)
+        self.non_timeout_reset = term_pitch | term_roll | term_low_height | term_high_height
+        self.reset_buf = timeout | self.non_timeout_reset
 
-        time_out_idx = (self.episode_length_buf > self.max_episode_length).nonzero(as_tuple=False).flatten()
+        time_out_idx = timeout.nonzero(as_tuple=False).flatten()
         self.extras["time_outs"] = torch.zeros_like(self.reset_buf, device=self.device, dtype=gs.tc_float)
         self.extras["time_outs"][time_out_idx] = 1.0
-
-        self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())    
         
         self.rew_buf[:] = 0.0
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+
+        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
+        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
+
+        self.episode_error_sums["vel_xy"]  += lin_vel_error * self.dt
+        self.episode_error_sums["vel_yaw"] += ang_vel_error * self.dt
+
+        if self.env_cfg.get("auto_reset", True):
+            self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
         raw_obs = torch.cat(
             [
@@ -336,6 +325,7 @@ class Go2Env_Stair:
                 self.dof_vel * self.obs_scales["dof_vel"],  # 12
                 self.actions,  # 12
                 (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),  # 1
+                self._get_heights(),  # 121
             ],
             axis=-1,
         )
@@ -347,12 +337,6 @@ class Go2Env_Stair:
         self.last_actions[:] = self.actions[:]
         self.last_dof_vel[:] = self.dof_vel[:]
         self.commands[:, 4] = 0.0
-
-        lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
-        ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
-
-        self.episode_error_sums["vel_xy"]  += lin_vel_error * self.dt
-        self.episode_error_sums["vel_yaw"] += ang_vel_error * self.dt
 
         return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
 
@@ -375,9 +359,10 @@ class Go2Env_Stair:
             envs_idx=envs_idx,
         )
 
-        spawn_xy_range = self.env_cfg.get("spawn_xy_range", 3.0)
-        self.base_pos[envs_idx, 0] = gs_rand_float(-spawn_xy_range, spawn_xy_range, (len(envs_idx),), self.device)
-        self.base_pos[envs_idx, 1] = gs_rand_float(-spawn_xy_range, spawn_xy_range, (len(envs_idx),), self.device)
+        spawn_x_range = self.env_cfg.get("spawn_x_range", [-3.0, -2.0])
+        spawn_y_range = self.env_cfg.get("spawn_y_range", [-0.5, 0.5])
+        self.base_pos[envs_idx, 0] = gs_rand_float(spawn_x_range[0], spawn_x_range[1], (len(envs_idx),), self.device)
+        self.base_pos[envs_idx, 1] = gs_rand_float(spawn_y_range[0], spawn_y_range[1], (len(envs_idx),), self.device)
         
         px = torch.clip(((self.base_pos[envs_idx, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
         py = torch.clip(((self.base_pos[envs_idx, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
@@ -389,6 +374,7 @@ class Go2Env_Stair:
         # 🌟【真犯人逮捕】テレポート時にロボットの落下スピードを完全にゼロ(True)にする！
         self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.base_world_lin_vel[envs_idx] = 0
         self.base_lin_vel[envs_idx] = 0
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
@@ -431,9 +417,22 @@ class Go2Env_Stair:
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
         return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
 
+    def _reward_tracking_world_lin_vel_x(self):
+        lin_vel_error = torch.square(self.commands[:, 0] - self.base_world_lin_vel[:, 0])
+        return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_forward_progress(self):
+        return torch.clamp(self.base_world_lin_vel[:, 0], min=-1.0, max=1.0)
+
     def _reward_tracking_ang_vel(self):
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
+
+    def _reward_lateral_position(self):
+        return torch.square(self.base_pos[:, 1])
+
+    def _reward_yaw_orientation(self):
+        return torch.square(self.base_euler[:, 2])
 
     def _reward_lin_vel_z(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
@@ -459,3 +458,6 @@ class Go2Env_Stair:
 
     def _reward_feet_air_time(self):
         return torch.sum(torch.clamp(self.feet_air_time, 0.0, 0.5), dim=1)
+
+    def _reward_termination(self):
+        return self.non_timeout_reset.float()
