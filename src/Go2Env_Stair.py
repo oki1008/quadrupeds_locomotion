@@ -23,8 +23,7 @@ class Go2Env_Stair:
 
         self.simulate_action_latency = env_cfg.get("simulate_action_latency", True)
         self.dt = 0.02
-        self.sim_substeps = env_cfg.get("sim_substeps", 4)
-        self.rigid_dt = self.dt / self.sim_substeps
+        self.sim_substeps = env_cfg.get("sim_substeps", 30)
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
 
         self.env_cfg = env_cfg
@@ -46,7 +45,7 @@ class Go2Env_Stair:
             ),
             vis_options=gs.options.VisOptions(n_rendered_envs=num_envs, show_world_frame=False),
             rigid_options=gs.options.RigidOptions(
-                dt=self.rigid_dt,
+                dt=self.dt,
                 constraint_solver=gs.constraint_solver.Newton,
                 enable_collision=True,
                 enable_joint_limit=True,
@@ -191,7 +190,9 @@ class Go2Env_Stair:
         self.local_height_points[:, :, 1] = grid_y.flatten()
 
         self.num_history = 3
-        self.num_raw_obs = 48 + self.num_height_points
+        # go2_lidar4で歩けた構成に合わせ、まず地形高さを観測に入れない。
+        # 高さスキャン用バッファは階段評価・将来のheight obs版のために残す。
+        self.num_raw_obs = 48
         self.num_obs = self.num_raw_obs * self.num_history
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
         self.obs_history_buf = torch.zeros(
@@ -207,7 +208,11 @@ class Go2Env_Stair:
         self.commands[envs_idx, 3] = gs_rand_float(*self.command_cfg["height_range"], (len(envs_idx),), self.device)
         self.commands[envs_idx, 4] = 0.0
         
-        height_diff_scale = 0.5 + abs(self.commands[envs_idx, 3] - self.reward_cfg["base_height_target"])/ (self.command_cfg["height_range"][1] - self.reward_cfg["base_height_target"]) * 0.5
+        height_range_span = self.command_cfg["height_range"][1] - self.reward_cfg["base_height_target"]
+        if abs(height_range_span) < 1e-6:
+            height_diff_scale = torch.ones((len(envs_idx),), device=self.device)
+        else:
+            height_diff_scale = 0.5 + torch.abs(self.commands[envs_idx, 3] - self.reward_cfg["base_height_target"]) / height_range_span * 0.5
         self.commands[envs_idx, 0] *= height_diff_scale
         self.commands[envs_idx, 1] *= height_diff_scale
         self.commands[envs_idx, 2] *= height_diff_scale
@@ -235,13 +240,10 @@ class Go2Env_Stair:
         return torch.clip(relative_heights * self.obs_scales["height_measurements"], -1.0, 1.0)
        
     def step(self, actions, is_train=True):
-        safe_actions = torch.clip(actions, -2.0, 2.0)
-        self.actions = torch.clip(safe_actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
-        joint_clip = self.env_cfg.get("target_dof_pos_clip", 0.8)
-        target_dof_pos = torch.clip(target_dof_pos, self.default_dof_pos - joint_clip, self.default_dof_pos + joint_clip)
         self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
         self.scene.step()
         
@@ -284,16 +286,11 @@ class Go2Env_Stair:
         self.jump_toggled_buf = torch.clamp(self.jump_toggled_buf - 1.0, min=0.0)
         self.jump_target_height = torch.where(jump_cmd_now > 0.0, self.commands[:, 4], self.jump_target_height)
         
-        px_reset = torch.clip(((self.base_pos[:, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
-        py_reset = torch.clip(((self.base_pos[:, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
-        ground_height_reset = self.height_field_tensor[px_reset, py_reset]
-        local_height = self.base_pos[:, 2] - ground_height_reset
-
         timeout = self.episode_length_buf > self.max_episode_length
         term_pitch = torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         term_roll = torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
-        term_low_height = local_height < self.env_cfg.get("termination_min_height", 0.12)
-        term_high_height = local_height > self.env_cfg.get("termination_max_height", 1.2)
+        term_low_height = self.base_pos[:, 2] < self.env_cfg.get("termination_abs_min_height", 0.25)
+        term_high_height = self.base_pos[:, 2] > self.env_cfg.get("termination_max_height", 1.2)
         self.non_timeout_reset = term_pitch | term_roll | term_low_height | term_high_height
         self.reset_buf = timeout | self.non_timeout_reset
 
@@ -325,7 +322,6 @@ class Go2Env_Stair:
                 self.dof_vel * self.obs_scales["dof_vel"],  # 12
                 self.actions,  # 12
                 (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),  # 1
-                self._get_heights(),  # 121
             ],
             axis=-1,
         )
@@ -367,13 +363,11 @@ class Go2Env_Stair:
         px = torch.clip(((self.base_pos[envs_idx, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
         py = torch.clip(((self.base_pos[envs_idx, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
         ground_heights = self.height_field_tensor[px, py]
-        
-        self.base_pos[envs_idx, 2] = ground_heights + self.env_cfg.get("spawn_height_offset", 0.65)
+        self.base_pos[envs_idx, 2] = ground_heights + self.env_cfg.get("spawn_height_offset", 0.45)
 
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
-        # 🌟【真犯人逮捕】テレポート時にロボットの落下スピードを完全にゼロ(True)にする！
-        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
-        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
+        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
         self.base_world_lin_vel[envs_idx] = 0
         self.base_lin_vel[envs_idx] = 0
         self.base_ang_vel[envs_idx] = 0
@@ -436,11 +430,15 @@ class Go2Env_Stair:
 
     def _reward_lin_vel_z(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        return active_mask * torch.square(self.base_lin_vel[:, 2]) * 0.1
+        return active_mask * torch.square(self.base_lin_vel[:, 2])
+
+    def _reward_orientation(self):
+        active_mask = (self.jump_toggled_buf < 0.01).float()
+        return active_mask * torch.sum(torch.square(self.base_euler[:, :2]), dim=1)
 
     def _reward_action_rate(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        return active_mask * torch.sum(torch.square(self.last_actions - self.actions), dim=1) * 0.3
+        return active_mask * torch.sum(torch.square(self.last_actions - self.actions), dim=1)
 
     def _reward_similar_to_default(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
@@ -448,16 +446,10 @@ class Go2Env_Stair:
 
     def _reward_base_height(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        
-        px = torch.clip(((self.base_pos[:, 0] + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_rows - 1)
-        py = torch.clip(((self.base_pos[:, 1] + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long(), 0, self.n_cols - 1)
-        ground_heights = self.height_field_tensor[px, py]
-        
-        local_base_height = self.base_pos[:, 2] - ground_heights
-        return active_mask * torch.square(local_base_height - self.commands[:, 3])
+        return active_mask * torch.square(self.base_pos[:, 2] - self.commands[:, 3])
 
     def _reward_feet_air_time(self):
-        return torch.sum(torch.clamp(self.feet_air_time, 0.0, 0.5), dim=1)
+        return torch.sum(self.feet_air_time, dim=1)
 
     def _reward_termination(self):
         return self.non_timeout_reset.float()

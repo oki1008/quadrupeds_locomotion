@@ -40,24 +40,28 @@ env_cfg:
   resampling_time_s: 4.0
   action_scale: 0.25
   simulate_action_latency: true
-  clip_actions: 2.0
+  # go2_lidar4で歩けた設定に戻し、まず歩行の自由度を確保する
+  clip_actions: 100.0
   target_dof_pos_clip: 0.8
-  sim_substeps: 4
+  # go2_lidar4の歩行コアに合わせる
+  sim_substeps: 30
   terrain_width: 8.0
   terrain_length: 12.0
   horizontal_scale: 0.05
-  stair_start_x: -1.0
-  stair_end_x: 4.0
+  stair_start_x: 10.0
+  stair_end_x: 10.0
   terrain_step_width: 0.35
-  terrain_step_height: 0.03
-  spawn_x_range: [-3.0, -2.0]
-  spawn_y_range: [-0.5, 0.5]
-  spawn_height_offset: 0.28
+  terrain_step_height: 0.00 #0.03 いったんフラットにして、歩行性を確保する
+  # flat_debugではgo2_lidar4に近い初期位置に置いて、環境コード自体が歩けるか確認する
+  spawn_x_range: [1.5, 2.5]
+  spawn_y_range: [1.5, 2.5]
+  spawn_height_offset: 0.45
   termination_min_height: 0.12
   termination_max_height: 1.2
 
 obs_cfg:
-  num_obs: 507  # 48
+  # go2_lidar4で歩けた構成に合わせ、地形高さを観測に入れない 48 x 3 = 144 次元にする
+  num_obs: 144
   obs_scales:
     lin_vel: 2.0
     ang_vel: 0.25
@@ -66,28 +70,21 @@ obs_cfg:
     height_measurements: 5.0
 
 reward_cfg:
-  tracking_sigma: 0.03
+  tracking_sigma: 0.25
   base_height_target: 0.3
   feet_height_target: 0.075
   jump_upward_velocity: 1.2
   jump_reward_steps: 50
   ##主な報酬関数の重み付け
   reward_scales:
-    # 直進階段用: ロボット基準より、世界座標の+X方向へ進むことを強く評価する
-    tracking_lin_vel: 0.5
-    tracking_world_lin_vel_x: 8.0
-    # 直進階段用: 止まって耐えるより、実際に+X方向へ進む行動を直接評価する
-    forward_progress: 8.0
-    tracking_ang_vel: 1.0
-    # 直進階段用: 横ずれと進行方向からのyawずれを抑える
-    lateral_position: -0.5
-    yaw_orientation: -0.5
+    # go2_lidar4で歩けた報酬を土台にし、まず歩行性を壊さない
+    tracking_lin_vel: 1.0
+    tracking_ang_vel: 0.2
     lin_vel_z: -1.0
     base_height: -1.0
-    termination: -10.0
-    action_rate: -0.001
-    similar_to_default: -0.002
-    feet_air_time: 0.2
+    action_rate: -0.005
+    similar_to_default: -0.01
+    feet_air_time: 0.1
     # jump: 4.0
     # jump_height_tracking: 0.5
     # jump_height_achievement: 2.0
@@ -96,17 +93,18 @@ reward_cfg:
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
-  lin_vel_x_range: [0.2, 0.5]
-  # 直進階段用: 横移動と旋回コマンドは出さず、まず前進だけを学習させる
-  lin_vel_y_range: [0.0, 0.0]
-  ang_vel_range: [0.0, 0.0]
+  # go2_lidar4と同じく、前後左右・旋回を学習させる
+  lin_vel_x_range: [-1.0, 1.0]
+  lin_vel_y_range: [-0.5, 0.5]
+  ang_vel_range: [-0.6, 0.6]
   height_range: [0.28, 0.38]
   # jump_range: [0.5, 1.5]
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_stair_straight"
+  exp_name: "go2_stair_flat_debug"
+  #"go2_stair_straight"
   num_envs: 4096
-  max_iterations: 1000
+  max_iterations: 10000
   env: "Go2Env_Stair"
   device: "cuda:0"
