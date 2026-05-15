@@ -11,11 +11,10 @@ def gs_rand_float(lower, upper, shape, device):
 
 
 class Go2Env_Stair:
-    """Go2 locomotion env.
+    """Go2の平地・階段評価用環境。
 
-    The locomotion core intentionally follows the previously successful
-    go2_lidar4 setup. Terrain generation is config-driven so the same env can
-    be used first as flat ground, then as low stairs.
+    go2_lidar4で歩けたblind歩行を基準に、同じ環境クラスで
+    A: 平地学習、B: 階段ゼロショット評価、C: 階段学習を切り替える。
     """
 
     def __init__(
@@ -168,8 +167,8 @@ class Go2Env_Stair:
         self.local_height_points[:, :, 0] = grid_x.flatten()
         self.local_height_points[:, :, 1] = grid_y.flatten()
 
-        # go2_lidar4で歩けた観測: 48次元の自己状態を3フレーム履歴化した144次元。
-        # 高さスキャンは将来の比較用に計算可能だが、まずblind歩行を安定させる。
+        # blind観測: 48次元の自己状態を3フレーム履歴化する。
+        # 高さスキャンは計算できるが、ここでは観測に入れない。
         self.num_history = env_cfg.get("num_history", 3)
         self.num_raw_obs = 48
         self.num_obs = self.num_raw_obs * self.num_history
@@ -215,7 +214,7 @@ class Go2Env_Stair:
             height_field_raw = torch.where(grid_x < stair_start_x, torch.zeros_like(height_field_raw), step_idx * step_height)
             height_field_raw = torch.clamp(height_field_raw, max=max_step_idx * step_height)
 
-        # スタート地点は必ず平らにする。転倒ではなく歩行能力を評価するため。
+        # 初期転倒ではなく歩行能力を評価するため、スタート周辺だけ平らにする。
         flat_radius = self.env_cfg.get("start_flat_radius_cells", 20)
         center_x, center_y = n_rows // 2, n_cols // 2
         height_field_raw[
@@ -295,9 +294,16 @@ class Go2Env_Stair:
         return heights - self.base_pos[:, 2].unsqueeze(1)
 
     def step(self, actions, is_train=True):
-        self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
+        self.actions = torch.clip(actions,-self.env_cfg["clip_actions"],self.env_cfg["clip_actions"],)
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
+        joint_clip = self.env_cfg.get("target_dof_pos_clip", 0.8)
+        target_dof_pos = torch.clip(
+        target_dof_pos,
+        self.default_dof_pos - joint_clip,
+        self.default_dof_pos + joint_clip,
+    )
+
         self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
         self.scene.step()
 
@@ -419,8 +425,8 @@ class Go2Env_Stair:
         self.base_pos[envs_idx, 2] += self.env_cfg.get("spawn_height_offset", 0.45)
 
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
-        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=False, envs_idx=envs_idx)
-        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=False, envs_idx=envs_idx)
+        self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.base_lin_vel[envs_idx] = 0
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
@@ -505,7 +511,9 @@ class Go2Env_Stair:
 
     def _reward_base_height(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
-        return active_mask * torch.square(self.base_pos[:, 2] - self.commands[:, 3])
+        ground_height = self._terrain_height_at(self.base_pos[:, 0], self.base_pos[:, 1])
+        local_base_height = self.base_pos[:, 2] - ground_height
+        return active_mask * torch.square(local_base_height - self.commands[:, 3])
 
     def _reward_feet_air_time(self):
         return torch.sum(self.feet_air_time, dim=1)

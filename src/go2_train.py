@@ -59,7 +59,7 @@ def get_train_cfg(exp_name, max_iterations):
 
 
 def load_config(config_path):
-    """Load configuration from YAML file."""
+    """YAMLから環境・観測・報酬・指令・学習設定を読み込む。"""
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     with open(config_path, 'r') as f:
@@ -110,11 +110,10 @@ def main():
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
-    # Copy config file to log directory
+    # 後から同じ条件を確認できるよう、学習時のconfigをログに保存する。
     shutil.copy(args.config, os.path.join(log_dir, "config.yaml"))
 
-    # Dynamically import the environment module and class
-    # Expects: file name == class name (e.g., Go2Env.py with Go2Env class)
+    # configのenv名から環境クラスを読み込む。例: Go2Env_Stair.py / Go2Env_Stair
     env_module = importlib.import_module(env_name)
     env_class = getattr(env_module, env_name)
     env = env_class(
@@ -129,8 +128,7 @@ def main():
 
     runner = OnPolicyRunner(env, train_cfg_full, log_dir, device=effective_device)
 
-    #ここに続きから学習させたいファイルのパスを記入
-    #unner.load("logs/go2-walking/model_400.pt")
+    # 再開学習を使う場合は、ここでrunner.load(...)を呼ぶ。
 
     pickle.dump(
         [env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg_full],
@@ -142,8 +140,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-# training
-python examples/locomotion/go2_train.py
-"""

@@ -127,9 +127,7 @@ def main():
 
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=device)
     resume_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
-    # rsl_rl internally calls torch.load without map_location. If CUDA is
-    # temporarily invisible, this keeps CPU evaluation from crashing on a
-    # checkpoint that was saved from CUDA training.
+    # CUDAで保存したモデルをCPU評価する場合でも読み込めるようにする。
     original_torch_load = torch.load
     if device == "cpu":
         def torch_load_on_cpu(path, *load_args, **load_kwargs):

@@ -1,6 +1,6 @@
 env_cfg:
   num_actions: 12
-  # joint/link names
+  # Go2の初期関節角度
   default_joint_angles:  # [rad]
     FL_hip_joint: 0.0
     FR_hip_joint: 0.0
@@ -27,45 +27,45 @@ env_cfg:
     - RL_hip_joint
     - RL_thigh_joint
     - RL_calf_joint
-  # PD
+  # PD制御ゲイン
   kp: 20.0
   kd: 0.5
-  # termination
+  # 転倒判定
   termination_if_roll_greater_than: 0.6  # degree→rad
   termination_if_pitch_greater_than: 0.6  # degree→rad
-  # base pose
+  # 初期姿勢
   base_init_pos: [0.0, 0.0, 0.42]
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
   episode_length_s: 20.0
   resampling_time_s: 4.0
   action_scale: 0.25
   simulate_action_latency: true
-  # go2_lidar4で歩けた設定に戻し、まず歩行の自由度を確保する
+  # go2_lidar4で歩けた設定を基準に、まず平地のblind歩行を安定させる
   clip_actions: 100.0
   target_dof_pos_clip: 0.8
-  # go2_lidar4の歩行コアに合わせる
   sim_substeps: 30
-  # terrain_type: flatで歩行コア確認、stairで階段、roughで旧go2_lidar4風の不整地
-  terrain_type: "flat" # 地形設定: flat / stair / rough
+
+  # 地形設定: A=flat, B/C=stair, 旧go2_lidar4比較=rough
+  terrain_type: "flat"
   terrain_width: 20.0
   terrain_length: 20.0
   horizontal_scale: 0.05
   stair_start_x: 0.5
   stair_end_x: 4.0
   terrain_step_width: 0.35
-  terrain_step_height: 0.00 # flat確認後、0.01 -> 0.02 -> 0.03 と段階的に上げる
+  terrain_step_height: 0.00 # 階段評価では0.01 -> 0.02 -> 0.03のように段階的に上げる
   start_flat_radius_cells: 20
   
-  # flat_debugではgo2_lidar4に近い初期位置に置いて、環境コード自体が歩けるか確認する
+  # 平地・階段評価で共通して使う初期位置範囲
   spawn_x_range: [-0.5, 0.5]
   spawn_y_range: [-0.5, 0.5]
 
   spawn_height_offset: 0.45
-  termination_min_height: 0.12
+  termination_abs_min_height: 0.12
   termination_max_height: 1.2
 
 obs_cfg:
-  # go2_lidar4で歩けた構成に合わせ、地形高さを観測に入れない 48 x 3 = 144 次元にする
+  # blind観測: 地形高さを入れず、48次元の自己状態を3フレーム履歴化する
   num_obs: 144
   obs_scales:
     lin_vel: 2.0
@@ -76,21 +76,21 @@ obs_cfg:
 
 reward_cfg:
   tracking_sigma: 0.25
-  # go2_lidar4で歩けた基準を保ちつつ、すり足を少し減らすため胴体をわずかに高めに保つ。
+  # go2_lidar4で歩けた基準高さ。まず安定歩行を優先する。
   base_height_target: 0.30
   feet_height_target: 0.075
   jump_upward_velocity: 1.2
   jump_reward_steps: 50
-  ##主な報酬関数の重み付け
+  # 報酬関数の重み
   reward_scales:
-    # go2_lidar4と同じシンプル報酬。罰則を増やしすぎると「動かない安全姿勢」に落ちる。
+    # 罰則を増やしすぎると「動かない安全姿勢」に落ちるため、まずはシンプルにする。
     tracking_lin_vel: 1.0
     tracking_ang_vel: 0.2
     lin_vel_z: -1.0
     base_height: -1.0
     action_rate: -0.005
     similar_to_default: -0.01
-    # すり足改善用。上げすぎると跳ねるので、Aでは少しだけ強める。
+    # 足を浮かせる時間。上げすぎると跳ねるため控えめにする。
     feet_air_time: 0.10
     # jump: 4.0
     # jump_height_tracking: 0.5
@@ -100,8 +100,7 @@ reward_cfg:
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
-  # go2_lidar4と同じく、前後・左右・旋回を混ぜて学習する。
-  # 直進だけに絞るより、歩行パターンそのものが出やすい。
+  # 前後・左右・旋回を混ぜて学習し、汎用的な平地歩行を作る。
   lin_vel_x_range: [-1.0, 1.0]
   lin_vel_y_range: [-0.5, 0.5]
   ang_vel_range: [-0.6, 0.6]
@@ -111,7 +110,6 @@ command_cfg:
 
 train_cfg:
   exp_name: "go2_flat_base"
-  #"go2_stair_straight"
   num_envs: 4096
   max_iterations: 10000
   env: "Go2Env_Stair"
