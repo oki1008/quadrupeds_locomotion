@@ -45,16 +45,21 @@ env_cfg:
   target_dof_pos_clip: 0.8
   # go2_lidar4の歩行コアに合わせる
   sim_substeps: 30
-  terrain_width: 8.0
-  terrain_length: 12.0
+  # terrain_type: flatで歩行コア確認、stairで階段、roughで旧go2_lidar4風の不整地
+  terrain_type: "flat" # 地形設定: flat / stair / rough
+  terrain_width: 20.0
+  terrain_length: 20.0
   horizontal_scale: 0.05
-  stair_start_x: 10.0
-  stair_end_x: 10.0
+  stair_start_x: 0.5
+  stair_end_x: 4.0
   terrain_step_width: 0.35
-  terrain_step_height: 0.00 #0.03 いったんフラットにして、歩行性を確保する
+  terrain_step_height: 0.00 # flat確認後、0.01 -> 0.02 -> 0.03 と段階的に上げる
+  start_flat_radius_cells: 20
+  
   # flat_debugではgo2_lidar4に近い初期位置に置いて、環境コード自体が歩けるか確認する
-  spawn_x_range: [1.5, 2.5]
-  spawn_y_range: [1.5, 2.5]
+  spawn_x_range: [-0.5, 0.5]
+  spawn_y_range: [-0.5, 0.5]
+
   spawn_height_offset: 0.45
   termination_min_height: 0.12
   termination_max_height: 1.2
@@ -71,20 +76,22 @@ obs_cfg:
 
 reward_cfg:
   tracking_sigma: 0.25
-  base_height_target: 0.3
+  # go2_lidar4で歩けた基準を保ちつつ、すり足を少し減らすため胴体をわずかに高めに保つ。
+  base_height_target: 0.30
   feet_height_target: 0.075
   jump_upward_velocity: 1.2
   jump_reward_steps: 50
   ##主な報酬関数の重み付け
   reward_scales:
-    # go2_lidar4で歩けた報酬を土台にし、まず歩行性を壊さない
+    # go2_lidar4と同じシンプル報酬。罰則を増やしすぎると「動かない安全姿勢」に落ちる。
     tracking_lin_vel: 1.0
     tracking_ang_vel: 0.2
     lin_vel_z: -1.0
     base_height: -1.0
     action_rate: -0.005
     similar_to_default: -0.01
-    feet_air_time: 0.1
+    # すり足改善用。上げすぎると跳ねるので、Aでは少しだけ強める。
+    feet_air_time: 0.10
     # jump: 4.0
     # jump_height_tracking: 0.5
     # jump_height_achievement: 2.0
@@ -93,7 +100,8 @@ reward_cfg:
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
-  # go2_lidar4と同じく、前後左右・旋回を学習させる
+  # go2_lidar4と同じく、前後・左右・旋回を混ぜて学習する。
+  # 直進だけに絞るより、歩行パターンそのものが出やすい。
   lin_vel_x_range: [-1.0, 1.0]
   lin_vel_y_range: [-0.5, 0.5]
   ang_vel_range: [-0.6, 0.6]
@@ -102,7 +110,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_stair_flat_debug"
+  exp_name: "go2_flat_base"
   #"go2_stair_straight"
   num_envs: 4096
   max_iterations: 10000
