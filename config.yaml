@@ -65,8 +65,9 @@ env_cfg:
   termination_max_height: 1.2
 
 obs_cfg:
-  # blind観測: 地形高さを入れず、48次元の自己状態を3フレーム履歴化する
-  num_obs: 144
+  # false=blind(48x3=144), true=高さ情報あり((48+121)x3=507)
+  use_height_obs: true
+  num_history: 3
   obs_scales:
     lin_vel: 2.0
     ang_vel: 0.25
@@ -91,7 +92,7 @@ reward_cfg:
     action_rate: -0.005
     similar_to_default: -0.01
     # 足を浮かせる時間。上げすぎると跳ねるため控えめにする。
-    feet_air_time: 0.10
+    feet_air_time: 0.20
     # jump: 4.0
     # jump_height_tracking: 0.5
     # jump_height_achievement: 2.0
@@ -109,7 +110,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_flat_base"
+  exp_name: "go2_flat_base_true"
   num_envs: 4096
   max_iterations: 10000
   env: "Go2Env_Stair"

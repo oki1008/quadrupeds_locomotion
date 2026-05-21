@@ -35,7 +35,7 @@ class Go2Env_Stair:
         print("読み込むクラス: Go2Env_Stair")
 
         self.num_envs = num_envs
-        self.num_obs = obs_cfg["num_obs"]
+        self.num_obs = obs_cfg.get("num_obs", 0)
         self.num_privileged_obs = None
         self.num_actions = env_cfg["num_actions"]
         self.num_commands = command_cfg["num_commands"]
@@ -167,10 +167,11 @@ class Go2Env_Stair:
         self.local_height_points[:, :, 0] = grid_x.flatten()
         self.local_height_points[:, :, 1] = grid_y.flatten()
 
-        # blind観測: 48次元の自己状態を3フレーム履歴化する。
-        # 高さスキャンは計算できるが、ここでは観測に入れない。
-        self.num_history = env_cfg.get("num_history", 3)
-        self.num_raw_obs = 48
+        # use_height_obs=falseならblind、trueなら高さスキャン121点も観測に入れる。
+        self.use_height_obs = obs_cfg.get("use_height_obs", False)
+        self.num_history = obs_cfg.get("num_history", 3)
+        self.num_base_obs = 48
+        self.num_raw_obs = self.num_base_obs + (self.num_height_points if self.use_height_obs else 0)
         self.num_obs = self.num_raw_obs * self.num_history
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
         self.obs_history_buf = torch.zeros(
@@ -269,6 +270,7 @@ class Go2Env_Stair:
     def _sample_jump_commands(self, envs_idx):
         self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["jump_range"], (len(envs_idx),), self.device)
 
+    #高さ情報の計算
     def _get_heights(self):
         yaw = self.base_euler[:, 2]
         cos_yaw = torch.cos(yaw).unsqueeze(1)
@@ -369,19 +371,20 @@ class Go2Env_Stair:
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
-
-        raw_obs = torch.cat(
-            [
-                self.base_ang_vel * self.obs_scales["ang_vel"],
-                self.projected_gravity,
-                self.commands * self.commands_scale,
-                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
-                self.dof_vel * self.obs_scales["dof_vel"],
-                self.actions,
-                (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),
-            ],
-            dim=-1,
-        )
+        
+        # 1フレーム分の観測。（高さ情報はuse_height_obsで切り替え）
+        obs_parts = [
+            self.base_ang_vel * self.obs_scales["ang_vel"],
+            self.projected_gravity,
+            self.commands * self.commands_scale,
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
+            self.dof_vel * self.obs_scales["dof_vel"],
+            self.actions,
+            (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),
+        ]
+        if self.use_height_obs:
+            obs_parts.append(self._get_heights() * self.obs_scales["height_measurements"])
+        raw_obs = torch.cat(obs_parts, dim=-1)
 
         self.obs_history_buf = torch.roll(self.obs_history_buf, shifts=1, dims=1)
         self.obs_history_buf[:, 0] = raw_obs
