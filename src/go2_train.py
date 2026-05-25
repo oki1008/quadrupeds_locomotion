@@ -59,7 +59,7 @@ def get_train_cfg(exp_name, max_iterations):
 
 
 def load_config(config_path):
-    """YAMLから環境・観測・報酬・指令・学習設定を読み込む。"""
+    """configから環境・観測・報酬・指令・学習設定を読み込む。"""
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     with open(config_path, 'r') as f:

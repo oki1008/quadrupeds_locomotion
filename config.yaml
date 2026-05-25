@@ -1,4 +1,6 @@
+#シミュレーション環境・ロボット制御・地形・初期位置の設定
 env_cfg:
+  #go2の制御する関節数　4脚×3関節 = 12
   num_actions: 12
   # Go2の初期関節角度
   default_joint_angles:  # [rad]
@@ -30,7 +32,7 @@ env_cfg:
   # PD制御ゲイン
   kp: 20.0
   kd: 0.5
-  # 転倒判定
+  # 転倒判定 胴体のroll/pitchがこれを超えると転倒扱い
   termination_if_roll_greater_than: 0.6  # degree→rad
   termination_if_pitch_greater_than: 0.6  # degree→rad
   # 初期姿勢
@@ -43,9 +45,9 @@ env_cfg:
   # go2_lidar4で歩けた設定を基準に、まず平地のblind歩行を安定させる
   clip_actions: 100.0
   target_dof_pos_clip: 0.8
-  sim_substeps: 30
+  sim_substeps: 30 #4
 
-  # 地形設定: A=flat, B/C=stair, 旧go2_lidar4比較=rough
+  # 地形設定: flat, stair, rough
   terrain_type: "flat"
   terrain_width: 20.0
   terrain_length: 20.0
@@ -56,17 +58,19 @@ env_cfg:
   terrain_step_height: 0.00 # 階段評価では0.01 -> 0.02 -> 0.03のように段階的に上げる
   start_flat_radius_cells: 20
   
-  # 平地・階段評価で共通して使う初期位置範囲
-  spawn_x_range: [-0.5, 0.5]
-  spawn_y_range: [-0.5, 0.5]
-
+  # 初期位置・高さ
+  spawn_x_range: [1.5, 2.5]
+  spawn_y_range: [1.5, 2.5]
   spawn_height_offset: 0.45
+
+  # 終了条件の胴体高さ
   termination_abs_min_height: 0.12
   termination_max_height: 1.2
 
+#policyに渡す観測の設定
 obs_cfg:
   # false=blind(48x3=144), true=高さ情報あり((48+121)x3=507)
-  use_height_obs: true
+  use_height_obs: false
   num_history: 3
   obs_scales:
     lin_vel: 2.0
@@ -86,13 +90,14 @@ reward_cfg:
   reward_scales:
     # 罰則を増やしすぎると「動かない安全姿勢」に落ちるため、まずはシンプルにする。
     tracking_lin_vel: 1.0
+    #tracking_world_lin_vel_x: 4.0
     tracking_ang_vel: 0.2
     lin_vel_z: -1.0
     base_height: -1.0
     action_rate: -0.005
     similar_to_default: -0.01
     # 足を浮かせる時間。上げすぎると跳ねるため控えめにする。
-    feet_air_time: 0.20
+    feet_air_time: 0.10
     # jump: 4.0
     # jump_height_tracking: 0.5
     # jump_height_achievement: 2.0
@@ -110,7 +115,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_flat_base_true"
+  exp_name: "go2_0524"
   num_envs: 4096
   max_iterations: 10000
   env: "Go2Env_Stair"
