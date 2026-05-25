@@ -6,15 +6,26 @@ import torch.nn.functional as F
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 
 
+"""Go2用の強化学習環境。
+
+Go2ロボット、地形、観測、報酬、reset/stepをまとめて定義する。
+"""
+
+
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
 
 class Go2Env_Stair:
-    """Go2の平地・階段評価用環境。
+    """Go2の平地・階段評価用RL環境クラス。
 
-    go2_lidar4で歩けたblind歩行を基準に、同じ環境クラスで
-    A: 平地学習、B: 階段ゼロショット評価、C: 階段学習を切り替える。
+    主な役割:
+    - GenesisのSceneを作る。
+    - Go2のURDFモデルを読み込む。
+    - flat / stair / rough の地形を作る。
+    - Actorに渡す観測を作る。
+    - 報酬と終了条件を計算する。
+    - reset() / step() でPPO学習用の環境として動く。
     """
 
     def __init__(
@@ -70,8 +81,10 @@ class Go2Env_Stair:
             show_viewer=show_viewer,
         )
 
+        # 地形を先に作り、その上にロボットを配置する。
         self._build_terrain()
 
+        # Go2本体のURDFを読み込む場所。
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=self.device)
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=self.device)
         self.inv_base_init_quat = inv_quat(self.base_init_quat)
@@ -94,10 +107,12 @@ class Go2Env_Stair:
 
         self.scene.build(n_envs=num_envs, env_spacing=(1.0, 1.0))
 
+        # 学習で制御する12関節だけを取り出し、PD制御のゲインを設定する。
         self.motor_dofs = [self.robot.get_joint(name).dof_idx_local for name in self.env_cfg["dof_names"]]
         self.robot.set_dofs_kp([self.env_cfg["kp"]] * self.num_actions, self.motor_dofs)
         self.robot.set_dofs_kv([self.env_cfg["kd"]] * self.num_actions, self.motor_dofs)
 
+        # configに書いた報酬名から、対応する_reward_xxx関数を自動登録する。
         self.reward_functions, self.episode_sums = {}, {}
         for name in self.reward_scales.keys():
             self.reward_scales[name] *= self.dt
@@ -159,6 +174,7 @@ class Go2Env_Stair:
         self.jump_target_height = torch.zeros((self.num_envs,), device=self.device)
         self.extras = {}
 
+        # 高さ観測用のローカル格子点。use_height_obs=falseなら計算しても観測には入れない。
         measure_points_x = torch.linspace(-0.8, 0.8, 11, device=self.device)
         measure_points_y = torch.linspace(-0.5, 0.5, 11, device=self.device)
         grid_x, grid_y = torch.meshgrid(measure_points_x, measure_points_y, indexing="ij")
@@ -181,6 +197,7 @@ class Go2Env_Stair:
         )
 
     def _build_terrain(self):
+        """configのterrain_typeに応じてflat / stair / rough地形を作る。"""
         terrain_type = self.env_cfg.get("terrain_type", "stair")
         terrain_width = self.env_cfg.get("terrain_width", 20.0)
         terrain_length = self.env_cfg.get("terrain_length", 20.0)
@@ -190,6 +207,7 @@ class Go2Env_Stair:
         n_cols = int(terrain_length / horizontal_scale)
 
         if terrain_type == "rough":
+            # 粗いランダム地形を補間して、なめらかな不整地を作る。
             seed_resolution = self.env_cfg.get("rough_seed_resolution", 20)
             small_noise = torch.rand((1, 1, seed_resolution, seed_resolution), device=self.device)
             height_field_raw = F.interpolate(
@@ -203,6 +221,7 @@ class Go2Env_Stair:
             height_field_raw = torch.zeros((n_rows, n_cols), device=self.device)
 
         if terrain_type == "stair":
+            # x方向に進むほど高さが増える階段地形を作る。
             x = (torch.arange(n_rows, device=self.device) - n_rows // 2) * horizontal_scale
             grid_x = x[:, None].repeat(1, n_cols)
             step_width = self.env_cfg.get("terrain_step_width", 0.35)
@@ -239,6 +258,7 @@ class Go2Env_Stair:
         )
 
     def _sample_commands(self, envs_idx):
+        """学習中に各環境へ与える目標速度・目標高さをランダムに更新する。"""
         self.commands[envs_idx, 0] = gs_rand_float(
             *self.command_cfg["lin_vel_x_range"], (len(envs_idx),), self.device
         )
@@ -270,8 +290,8 @@ class Go2Env_Stair:
     def _sample_jump_commands(self, envs_idx):
         self.commands[envs_idx, 4] = gs_rand_float(*self.command_cfg["jump_range"], (len(envs_idx),), self.device)
 
-    #高さ情報の計算
     def _get_heights(self):
+        """ロボット周囲121点の地形高さを、胴体高さからの相対値として返す。"""
         yaw = self.base_euler[:, 2]
         cos_yaw = torch.cos(yaw).unsqueeze(1)
         sin_yaw = torch.sin(yaw).unsqueeze(1)
@@ -296,6 +316,7 @@ class Go2Env_Stair:
         return heights - self.base_pos[:, 2].unsqueeze(1)
 
     def step(self, actions, is_train=True):
+        # Actorの出力を関節目標角に変換し、PD制御でロボットへ入力する。
         self.actions = torch.clip(actions,-self.env_cfg["clip_actions"],self.env_cfg["clip_actions"],)
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
@@ -309,6 +330,7 @@ class Go2Env_Stair:
         self.robot.control_dofs_position(target_dof_pos, self.motor_dofs)
         self.scene.step()
 
+        # 足先接触を見て、feet_air_time報酬用の空中時間を更新する。
         all_forces = self.robot.get_links_net_contact_force()
         forces = all_forces[:, self.feet_indices, :]
         contacts = torch.norm(forces, dim=-1) > 0.1
@@ -317,6 +339,7 @@ class Go2Env_Stair:
         self.last_contacts = contacts
 
         self.episode_length_buf += 1
+        # シミュレーション後のロボット状態をGenesisから取得し、観測と報酬に使う。
         self.base_pos[:] = self.robot.get_pos()
         self.base_quat[:] = self.robot.get_quat()
         self.base_euler = quat_to_xyz(
@@ -335,6 +358,7 @@ class Go2Env_Stair:
             .flatten()
         )
         if is_train:
+            # 学習時だけ目標速度を定期的に変える。評価時はコマンド固定。
             self._sample_commands(envs_idx)
             random_idxs_1 = torch.randperm(self.num_envs, device=self.device)[: int(self.num_envs * 0.05)]
             self._sample_commands(random_idxs_1)
@@ -347,6 +371,7 @@ class Go2Env_Stair:
         self.jump_toggled_buf = torch.clamp(self.jump_toggled_buf - 1.0, min=0.0)
         self.jump_target_height = torch.where(jump_cmd_now > 0.0, self.commands[:, 4], self.jump_target_height)
 
+        # 転倒・低すぎる高さ・タイムアウトを終了条件として扱う。
         term_timeout = self.episode_length_buf > self.max_episode_length
         term_pitch = torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         term_roll = torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
@@ -366,6 +391,7 @@ class Go2Env_Stair:
         if self.env_cfg.get("auto_reset", True):
             self.reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
 
+        # 登録された報酬関数を順に計算して合計する。
         self.rew_buf[:] = 0.0
         for name, reward_func in self.reward_functions.items():
             rew = reward_func() * self.reward_scales[name]
@@ -386,6 +412,7 @@ class Go2Env_Stair:
             obs_parts.append(self._get_heights() * self.obs_scales["height_measurements"])
         raw_obs = torch.cat(obs_parts, dim=-1)
 
+        # raw_obsを履歴方向に積む。num_history=3なら3フレーム分をActor入力にする。
         self.obs_history_buf = torch.roll(self.obs_history_buf, shifts=1, dims=1)
         self.obs_history_buf[:, 0] = raw_obs
         self.obs_buf = self.obs_history_buf.view(self.num_envs, -1)
@@ -408,9 +435,11 @@ class Go2Env_Stair:
         return None
 
     def reset_idx(self, envs_idx):
+        """指定された環境だけ初期姿勢・初期位置・履歴をリセットする。"""
         if len(envs_idx) == 0:
             return
 
+        # 関節をデフォルト姿勢に戻す。
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
@@ -420,6 +449,7 @@ class Go2Env_Stair:
             envs_idx=envs_idx,
         )
 
+        # 地形高さにspawn_height_offsetを足して、地面に埋まらない位置から開始する。
         spawn_x_range = self.env_cfg.get("spawn_x_range", [1.5, 2.5])
         spawn_y_range = self.env_cfg.get("spawn_y_range", [1.5, 2.5])
         self.base_pos[envs_idx, 0] = gs_rand_float(spawn_x_range[0], spawn_x_range[1], (len(envs_idx),), self.device)
@@ -461,6 +491,7 @@ class Go2Env_Stair:
         self.commands[envs_idx, 3] = self.reward_cfg["base_height_target"]
 
     def _terrain_height_at(self, x, y):
+        """ワールド座標(x, y)に対応する地形高さをheight fieldから読む。"""
         px = ((x + (self.n_rows * self.horizontal_scale) / 2) / self.horizontal_scale).long()
         py = ((y + (self.n_cols * self.horizontal_scale) / 2) / self.horizontal_scale).long()
         px = torch.clip(px, 0, self.n_rows - 1)
@@ -473,10 +504,12 @@ class Go2Env_Stair:
         return self.obs_buf, None
 
     def _reward_tracking_lin_vel(self):
+        # 目標の前後・左右速度に近いほど高い報酬。
         lin_vel_error = torch.sum(torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]), dim=1)
         return torch.exp(-lin_vel_error / self.reward_cfg["tracking_sigma"])
 
     def _reward_tracking_ang_vel(self):
+        # 目標ヨー角速度に近いほど高い報酬。
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error / self.reward_cfg["tracking_sigma"])
 
@@ -513,6 +546,7 @@ class Go2Env_Stair:
         return active_mask * torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1)
 
     def _reward_base_height(self):
+        # 地形高さを引いた胴体高さが、目標高さに近いほどペナルティが小さい。
         active_mask = (self.jump_toggled_buf < 0.01).float()
         ground_height = self._terrain_height_at(self.base_pos[:, 0], self.base_pos[:, 1])
         local_base_height = self.base_pos[:, 2] - ground_height
