@@ -4,14 +4,14 @@ env_cfg:
   num_actions: 12
   # Go2の初期関節角度
   default_joint_angles:  # [rad]
-    FL_hip_joint: 0.0
-    FR_hip_joint: 0.0
-    RL_hip_joint: 0.0
-    RR_hip_joint: 0.0
+    FL_hip_joint: 0.1
+    FR_hip_joint: -0.1
+    RL_hip_joint: 0.1
+    RR_hip_joint: -0.1
     FL_thigh_joint: 0.8
     FR_thigh_joint: 0.8
-    RL_thigh_joint: 1.0
-    RR_thigh_joint: 1.0
+    RL_thigh_joint: 0.8
+    RR_thigh_joint: 0.8
     FL_calf_joint: -1.5
     FR_calf_joint: -1.5
     RL_calf_joint: -1.5
@@ -30,11 +30,11 @@ env_cfg:
     - RL_thigh_joint
     - RL_calf_joint
   # PD制御ゲイン
-  kp: 20.0
+  kp: 25.0
   kd: 0.5
   # 転倒判定 胴体のroll/pitchがこれを超えると転倒扱い
-  termination_if_roll_greater_than: 0.6  # degree→rad
-  termination_if_pitch_greater_than: 0.6  # degree→rad
+  termination_if_roll_greater_than: 1.0  # degree→rad
+  termination_if_pitch_greater_than: 1.0  # degree→rad
   # 初期姿勢
   base_init_pos: [0.0, 0.0, 0.42]
   base_init_quat: [1.0, 0.0, 0.0, 0.0]
@@ -59,8 +59,8 @@ env_cfg:
   start_flat_radius_cells: 20
   
   # 初期位置・高さ
-  spawn_x_range: [1.5, 2.5]
-  spawn_y_range: [1.5, 2.5]
+  spawn_x_range: [-0.3, 0.3]
+  spawn_y_range: [-0.3, 0.3]
   spawn_height_offset: 0.45
 
   # 終了条件の胴体高さ
@@ -69,7 +69,8 @@ env_cfg:
 
 #policyに渡す観測の設定
 obs_cfg:
-  # false=blind(48x3=144), true=高さ情報あり((48+121)x3=507)
+  # Go2WheelEnv: false=blind((48+車輪4)x3=156), true=高さ情報あり((52+121)x3=519)
+  # Go2Env_Stair: false=blind(48x3=144), true=高さ情報あり((48+121)x3=507)
   use_height_obs: false
   num_history: 3
   obs_scales:
@@ -77,46 +78,40 @@ obs_cfg:
     ang_vel: 0.25
     dof_pos: 1.0
     dof_vel: 0.05
-    height_measurements: 5.0
+    height_measurements: 1.0
 
 reward_cfg:
   tracking_sigma: 0.25
   # go2_lidar4で歩けた基準高さ。まず安定歩行を優先する。
-  base_height_target: 0.30
+  base_height_target: 0.29
   feet_height_target: 0.075
   jump_upward_velocity: 1.2
   jump_reward_steps: 50
+  
   # 報酬関数の重み
   reward_scales:
-    # 罰則を増やしすぎると「動かない安全姿勢」に落ちるため、まずはシンプルにする。
-    tracking_lin_vel: 1.0
-    #tracking_world_lin_vel_x: 4.0
-    tracking_ang_vel: 0.2
-    lin_vel_z: -1.0
-    base_height: -1.0
-    action_rate: -0.005
-    similar_to_default: -0.01
-    # 足を浮かせる時間。上げすぎると跳ねるため控えめにする。
-    feet_air_time: 0.10
-    # jump: 4.0
-    # jump_height_tracking: 0.5
-    # jump_height_achievement: 2.0
-    # jump_speed: 1.0
-    # jump_landing: 0.08
+    tracking_lin_vel: 1.8
+    tracking_ang_vel: 1.3
+    lin_vel_z: -2.0
+    orientation: -0.2
+    base_height: -1.6
+    action_rate: -0.01
+    similar_to_default: -0.05
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
   # 前後・左右・旋回を混ぜて学習し、汎用的な平地歩行を作る。
-  lin_vel_x_range: [-1.0, 1.0]
+  lin_vel_x_range: [-0.5, 1.0]
   lin_vel_y_range: [-0.5, 0.5]
-  ang_vel_range: [-0.6, 0.6]
-  height_range: [0.28, 0.38]
+  ang_vel_range: [-1.0, 1.0]
+  height_range: [0.29, 0.29]
   # jump_range: [0.5, 1.5]
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_0524"
+  exp_name: "go2_wheel_0526"
   num_envs: 4096
   max_iterations: 10000
-  env: "Go2Env_Stair"
+  # env: "Go2Env_Stair"  # Go2本体用。車輪付き確認後に戻す場合はこれを使う。
+  env: "Go2WheelEnv"     # 一時確認用: Go2 + 受動車輪モデルを読み込む。
   device: "cuda:0"
