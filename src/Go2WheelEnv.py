@@ -203,11 +203,11 @@ class Go2WheelEnv:
         self.local_height_points[:, :, 0] = grid_x.flatten()
         self.local_height_points[:, :, 1] = grid_y.flatten()
 
-        # use_height_obs=falseならblind、trueなら高さスキャン121点も観測に入れる。
-        # 車輪付きでは受動車輪4関節の角速度も観測に入れる。
+        # configに合わせて観測次元を決める。
         self.use_height_obs = obs_cfg.get("use_height_obs", False)
+        self.use_wheel_vel_obs = obs_cfg.get("use_wheel_vel_obs", True)
         self.num_history = obs_cfg.get("num_history", 3)
-        self.num_base_obs = 52
+        self.num_base_obs = 48 + (4 if self.use_wheel_vel_obs else 0)
         self.num_raw_obs = self.num_base_obs + (self.num_height_points if self.use_height_obs else 0)
         self.num_obs = self.num_raw_obs * self.num_history
         self.obs_buf = torch.zeros((self.num_envs, self.num_obs), device=self.device, dtype=gs.tc_float)
@@ -426,17 +426,18 @@ class Go2WheelEnv:
             self.rew_buf += rew
             self.episode_sums[name] += rew
         
-        # 1フレーム分の観測。（高さ情報はuse_height_obsで切り替え）
+        # 1フレーム分の観測を作る。
         obs_parts = [
             self.base_ang_vel * self.obs_scales["ang_vel"],
             self.projected_gravity,
             self.commands * self.commands_scale,
             (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
             self.dof_vel * self.obs_scales["dof_vel"],
-            self.wheel_dof_vel * self.obs_scales["dof_vel"],
             self.actions,
             (self.jump_toggled_buf / self.reward_cfg["jump_reward_steps"]).unsqueeze(-1),
         ]
+        if self.use_wheel_vel_obs:
+            obs_parts.insert(5, self.wheel_dof_vel * self.obs_scales["dof_vel"])
         if self.use_height_obs:
             obs_parts.append(self._get_heights() * self.obs_scales["height_measurements"])
         raw_obs = torch.cat(obs_parts, dim=-1)

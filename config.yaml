@@ -67,10 +67,11 @@ env_cfg:
   termination_abs_min_height: 0.12
   termination_max_height: 1.2
 
-#policyに渡す観測の設定
+# policyに渡す観測の設定
 obs_cfg:
-  # Go2WheelEnv: false=blind((48+車輪4)x3=156), true=高さ情報あり((52+121)x3=519)
-  # Go2Env_Stair: false=blind(48x3=144), true=高さ情報あり((48+121)x3=507)
+  # 受動車輪4関節の角速度を観測に入れる
+  use_wheel_vel_obs: false
+  # 観測に高さ情報を入れる
   use_height_obs: false
   num_history: 3
   obs_scales:
@@ -109,7 +110,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_wheel_0529"
+  exp_name: "no_wheel_vel_obs_0601"
   num_envs: 4096
   max_iterations: 10000
   # env: "Go2Env_Stair"  # Go2本体用。車輪付き確認後に戻す場合はこれを使う。
