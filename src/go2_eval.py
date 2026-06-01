@@ -228,6 +228,51 @@ def main():
         if args.success_min_terrain_gain is not None
         else (0.0 if env_cfg.get("terrain_type") != "stair" else env_cfg.get("terrain_step_height", 0.0) * 3.0)
     )
+    target_distance_x = args.lin_vel_x * args.duration_s
+    target_distance_y = args.lin_vel_y * args.duration_s
+    target_yaw = args.ang_vel * args.duration_s
+    abs_cmd_x = abs(args.lin_vel_x)
+    abs_cmd_y = abs(args.lin_vel_y)
+    abs_cmd_yaw = abs(args.ang_vel)
+
+    if abs_cmd_yaw > max(abs_cmd_x, abs_cmd_y) and abs_cmd_yaw > 1e-6:
+        motion_type = "yaw"
+        target_yaw_min = abs(target_yaw) * 0.6
+        motion_success = (
+            active
+            & (torch.abs(final_euler[:, 2]) >= target_yaw_min)
+            & (torch.abs(distance[:, 0]) <= max(0.5, abs(target_yaw) * 0.15))
+            & (torch.abs(distance[:, 1]) <= max(0.5, abs(target_yaw) * 0.15))
+            & (base_clearance >= args.success_min_clearance)
+        )
+    elif abs_cmd_y > abs_cmd_x and abs_cmd_y > 1e-6:
+        motion_type = "lateral_positive" if args.lin_vel_y > 0.0 else "lateral_negative"
+        target_distance_y_min = abs(target_distance_y) * 0.8
+        motion_success = (
+            active
+            & ((distance[:, 1] * (1.0 if args.lin_vel_y > 0.0 else -1.0)) >= target_distance_y_min)
+            & (torch.abs(distance[:, 0]) <= max(0.4, target_distance_y_min * 0.25))
+            & (base_clearance >= args.success_min_clearance)
+        )
+    elif abs_cmd_x > 1e-6:
+        motion_type = "forward" if args.lin_vel_x > 0.0 else "backward"
+        target_distance_x_min = abs(target_distance_x) * 0.8
+        motion_success = (
+            active
+            & ((distance[:, 0] * (1.0 if args.lin_vel_x > 0.0 else -1.0)) >= target_distance_x_min)
+            & (torch.abs(distance[:, 1]) <= max(0.25, target_distance_x_min * 0.15))
+            & (terrain_height_gain >= success_min_terrain_gain)
+            & (base_clearance >= args.success_min_clearance)
+        )
+    else:
+        motion_type = "stand"
+        motion_success = (
+            active
+            & (torch.norm(distance[:, :2], dim=1) <= 0.25)
+            & (base_clearance >= args.success_min_clearance)
+        )
+    motion_success_rate = motion_success.float().mean().item()
+
     strict_success = (
         active
         & (distance[:, 0] >= success_min_distance_x)
@@ -247,6 +292,7 @@ def main():
         print(f"terrain_step_width: {env_cfg.get('terrain_step_width')}")
     print(f"num_envs: {num_envs}")
     print(f"command: {command[0].detach().cpu().tolist()}")
+    print(f"motion_type: {motion_type}")
     print(f"survival_rate: {survival_rate:.4f}")
     print(f"duration_mean_s: {duration.mean().item():.4f}")
     print(f"distance_x_mean_m: {distance[:, 0].mean().item():.4f}")
@@ -265,6 +311,10 @@ def main():
     print(f"vel_yaw_error_mean: {vel_yaw_error.mean().item():.4f}")
     for key, values in term_sums.items():
         print(f"term_{key}_rate: {values.mean().item():.4f}")
+    print(f"motion_success_rate: {motion_success_rate:.4f}")
+    print(f"target_distance_x_m: {target_distance_x:.4f}")
+    print(f"target_distance_y_m: {target_distance_y:.4f}")
+    print(f"target_yaw_rad: {target_yaw:.4f}")
     print(f"strict_success_rate: {strict_success_rate:.4f}")
     print(f"success_min_distance_x: {success_min_distance_x:.4f}")
     print(f"success_min_terrain_gain: {success_min_terrain_gain:.4f}")

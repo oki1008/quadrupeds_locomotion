@@ -90,13 +90,13 @@ reward_cfg:
   
   # 報酬関数の重み
   reward_scales:
-    tracking_lin_vel: 1.8
-    tracking_ang_vel: 1.3
-    lin_vel_z: -2.0
-    orientation: -0.2
-    base_height: -1.6
-    action_rate: -0.01
-    similar_to_default: -0.05
+    tracking_lin_vel: 2.0      # 目標の前後・左右速度に追従する報酬
+    tracking_ang_vel: 1.3      # 目標の旋回速度に追従する報酬
+    lin_vel_z: -2.0            # 胴体が上下に跳ねる動きを抑える罰則
+    orientation: -0.2          # 胴体のroll/pitchの傾きを抑える罰則
+    base_height: -1.0          # 胴体高さを目標値付近に保つ罰則
+    action_rate: -0.02         # 行動の急変を抑えて滑らかな動きにする罰則
+    similar_to_default: -0.08  # 関節角度が初期姿勢から大きく外れるのを抑える罰則
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
@@ -109,7 +109,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "go2_wheel_0526"
+  exp_name: "go2_wheel_0529"
   num_envs: 4096
   max_iterations: 10000
   # env: "Go2Env_Stair"  # Go2本体用。車輪付き確認後に戻す場合はこれを使う。
