@@ -6,29 +6,25 @@ import torch.nn.functional as F
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 
 
-"""Go2 + 受動車輪用の強化学習環境。
-
-車輪付きGo2ロボット、地形、観測、報酬、reset/stepをまとめて定義する。
-"""
-
+#Go2 + 受動車輪用の強化学習環境。
+#車輪付きGo2ロボット、地形、観測、報酬、reset/stepをまとめて定義する。
 
 def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
+#Go2 + 受動車輪のRL環境クラス。
+
+    #主な役割:
+    #GenesisのSceneを作る。
+    #Go2 + 受動車輪のURDFモデルを読み込む。
+    #flat / stair / rough の地形を作る。
+    #Actorに渡す観測を作る。
+    #報酬と終了条件を計算する。
+    # reset() / step() でPPO学習用の環境として動く。
+
+    #最初はGo2と同じ12関節だけを制御し、4つの車輪関節は受動関節として扱う。
 
 class Go2WheelEnv:
-    """Go2 + 受動車輪のRL環境クラス。
-
-    主な役割:
-    - GenesisのSceneを作る。
-    - Go2 + 受動車輪のURDFモデルを読み込む。
-    - flat / stair / rough の地形を作る。
-    - Actorに渡す観測を作る。
-    - 報酬と終了条件を計算する。
-    - reset() / step() でPPO学習用の環境として動く。
-
-    最初はGo2と同じ12関節だけを制御し、4つの車輪関節は受動関節として扱う。
-    """
 
     def __init__(
         self,

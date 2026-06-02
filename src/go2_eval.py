@@ -58,18 +58,299 @@ def make_env(env_name, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show
 
 
 def build_command(args, command_cfg, reward_cfg, device, num_envs):
+    return build_command_values(
+        command_cfg=command_cfg,
+        reward_cfg=reward_cfg,
+        device=device,
+        num_envs=num_envs,
+        lin_vel_x=args.lin_vel_x,
+        lin_vel_y=args.lin_vel_y,
+        ang_vel=args.ang_vel,
+        base_height=args.base_height,
+        jump_height=args.jump_height,
+    )
+
+
+def build_command_values(
+    command_cfg,
+    reward_cfg,
+    device,
+    num_envs,
+    lin_vel_x=0.3,
+    lin_vel_y=0.0,
+    ang_vel=0.0,
+    base_height=None,
+    jump_height=0.0,
+):
+    """評価用の一定commandを作る。"""
     num_commands = command_cfg["num_commands"]
     values = torch.zeros((num_envs, num_commands), device=device, dtype=gs.tc_float)
-    values[:, 0] = args.lin_vel_x
+    values[:, 0] = lin_vel_x
     if num_commands > 1:
-        values[:, 1] = args.lin_vel_y
+        values[:, 1] = lin_vel_y
     if num_commands > 2:
-        values[:, 2] = args.ang_vel
+        values[:, 2] = ang_vel
     if num_commands > 3:
-        values[:, 3] = args.base_height if args.base_height is not None else reward_cfg["base_height_target"]
+        values[:, 3] = base_height if base_height is not None else reward_cfg["base_height_target"]
     if num_commands > 4:
-        values[:, 4] = args.jump_height
+        values[:, 4] = jump_height
     return values
+
+
+def _mean(tensor):
+    return tensor.mean().item()
+
+
+def evaluate_policy(
+    env,
+    policy,
+    command,
+    duration_s=20.0,
+    success_min_distance_x=None,
+    success_min_terrain_gain=None,
+    success_min_clearance=0.16,
+    real_time=False,
+    show_viewer=False,
+    hold_viewer_s=0.0,
+):
+    """現在のpolicyを一定commandで評価し、数値指標をdictで返す。"""
+    obs, _ = env.reset()
+    env_cfg = env.env_cfg
+    num_envs = env.num_envs
+    lin_vel_x = command[0, 0].item()
+    lin_vel_y = command[0, 1].item() if command.shape[1] > 1 else 0.0
+    ang_vel = command[0, 2].item() if command.shape[1] > 2 else 0.0
+
+    start_pos = env.base_pos.clone()
+    start_terrain_height = env._terrain_height_at(start_pos[:, 0], start_pos[:, 1])
+    max_steps = int(duration_s / env.dt)
+
+    active = torch.ones(num_envs, device=env.device, dtype=torch.bool)
+    done_steps = torch.full((num_envs,), max_steps, device=env.device, dtype=gs.tc_float)
+    final_pos = env.base_pos.clone()
+    vel_xy_error_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+    vel_yaw_error_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+    term_sums = {
+        "roll": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
+        "pitch": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
+        "low_height": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
+        "high_height": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
+        "timeout": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
+    }
+    viewer_closed = False
+
+    with torch.no_grad():
+        for step in range(max_steps):
+            env.commands[:] = command
+            pre_step_pos = env.base_pos.clone()
+            actions = policy(obs)
+            active_before = active.clone()
+            try:
+                obs, _, _, dones, extras = env.step(actions, is_train=False)
+            except gs.GenesisException as exc:
+                if show_viewer and "Viewer closed" in str(exc):
+                    viewer_closed = True
+                    final_pos[active_before] = pre_step_pos[active_before]
+                    done_steps[active_before] = step
+                    active[active_before] = False
+                    break
+                raise
+
+            lin_vel_error = torch.sum(torch.square(command[:, :2] - env.base_lin_vel[:, :2]), dim=1)
+            yaw_error = torch.square(command[:, 2] - env.base_ang_vel[:, 2])
+            vel_xy_error_sum[active_before] += lin_vel_error[active_before] * env.dt
+            vel_yaw_error_sum[active_before] += yaw_error[active_before] * env.dt
+
+            newly_done = active_before & dones.bool()
+            if newly_done.any():
+                done_steps[newly_done] = step + 1
+                final_pos[newly_done] = pre_step_pos[newly_done]
+                for key in term_sums:
+                    term_key = "term_" + key
+                    if term_key in extras:
+                        term_sums[key][newly_done] = extras[term_key][newly_done]
+                active[newly_done] = False
+
+            if real_time:
+                time.sleep(env.dt)
+            if not active.any():
+                break
+
+    if show_viewer and hold_viewer_s > 0.0 and not viewer_closed:
+        time.sleep(hold_viewer_s)
+
+    duration = done_steps * env.dt
+    if active.any():
+        final_pos[active] = env.base_pos[active]
+    final_euler = env.base_euler.clone()
+    distance = final_pos - start_pos
+    final_terrain_height = env._terrain_height_at(final_pos[:, 0], final_pos[:, 1])
+    terrain_height_gain = final_terrain_height - start_terrain_height
+    base_clearance = final_pos[:, 2] - final_terrain_height
+    vel_xy_error = vel_xy_error_sum / torch.clamp(duration, min=env.dt)
+    vel_yaw_error = vel_yaw_error_sum / torch.clamp(duration, min=env.dt)
+    failure = (
+        (term_sums["roll"] > 0.0)
+        | (term_sums["pitch"] > 0.0)
+        | (term_sums["low_height"] > 0.0)
+        | (term_sums["high_height"] > 0.0)
+    )
+    survival_rate = (~failure).float().mean().item()
+    success_min_distance_x = (
+        success_min_distance_x
+        if success_min_distance_x is not None
+        else lin_vel_x * duration_s * 0.8
+    )
+    success_min_terrain_gain = (
+        success_min_terrain_gain
+        if success_min_terrain_gain is not None
+        else (0.0 if env_cfg.get("terrain_type") != "stair" else env_cfg.get("terrain_step_height", 0.0) * 3.0)
+    )
+    target_distance_x = lin_vel_x * duration_s
+    target_distance_y = lin_vel_y * duration_s
+    target_yaw = ang_vel * duration_s
+    abs_cmd_x = abs(lin_vel_x)
+    abs_cmd_y = abs(lin_vel_y)
+    abs_cmd_yaw = abs(ang_vel)
+
+    if abs_cmd_yaw > max(abs_cmd_x, abs_cmd_y) and abs_cmd_yaw > 1e-6:
+        motion_type = "yaw"
+        target_yaw_min = abs(target_yaw) * 0.6
+        motion_success = (
+            active
+            & (torch.abs(final_euler[:, 2]) >= target_yaw_min)
+            & (torch.abs(distance[:, 0]) <= max(0.5, abs(target_yaw) * 0.15))
+            & (torch.abs(distance[:, 1]) <= max(0.5, abs(target_yaw) * 0.15))
+            & (base_clearance >= success_min_clearance)
+        )
+    elif abs_cmd_y > abs_cmd_x and abs_cmd_y > 1e-6:
+        motion_type = "lateral_positive" if lin_vel_y > 0.0 else "lateral_negative"
+        target_distance_y_min = abs(target_distance_y) * 0.8
+        motion_success = (
+            active
+            & ((distance[:, 1] * (1.0 if lin_vel_y > 0.0 else -1.0)) >= target_distance_y_min)
+            & (torch.abs(distance[:, 0]) <= max(0.4, target_distance_y_min * 0.25))
+            & (base_clearance >= success_min_clearance)
+        )
+    elif abs_cmd_x > 1e-6:
+        motion_type = "forward" if lin_vel_x > 0.0 else "backward"
+        target_distance_x_min = abs(target_distance_x) * 0.8
+        motion_success = (
+            active
+            & ((distance[:, 0] * (1.0 if lin_vel_x > 0.0 else -1.0)) >= target_distance_x_min)
+            & (torch.abs(distance[:, 1]) <= max(0.25, target_distance_x_min * 0.15))
+            & (terrain_height_gain >= success_min_terrain_gain)
+            & (base_clearance >= success_min_clearance)
+        )
+    else:
+        motion_type = "stand"
+        motion_success = (
+            active
+            & (torch.norm(distance[:, :2], dim=1) <= 0.25)
+            & (base_clearance >= success_min_clearance)
+        )
+    motion_success_rate = motion_success.float().mean().item()
+
+    strict_success = (
+        active
+        & (distance[:, 0] >= success_min_distance_x)
+        & (torch.abs(distance[:, 1]) <= 0.25)
+        & (terrain_height_gain >= success_min_terrain_gain)
+        & (base_clearance >= success_min_clearance)
+    )
+    strict_success_rate = strict_success.float().mean().item()
+
+    result = {
+        "terrain_type": env_cfg.get("terrain_type", "unknown"),
+        "num_envs": num_envs,
+        "command": command[0].detach().cpu().tolist(),
+        "motion_type": motion_type,
+        "survival_rate": survival_rate,
+        "duration_mean_s": _mean(duration),
+        "distance_x_mean_m": _mean(distance[:, 0]),
+        "distance_y_mean_m": _mean(distance[:, 1]),
+        "distance_z_mean_m": _mean(distance[:, 2]),
+        "terrain_height_gain_mean_m": _mean(terrain_height_gain),
+        "terrain_height_gain_max_m": terrain_height_gain.max().item(),
+        "terrain_height_gain_min_m": terrain_height_gain.min().item(),
+        "final_base_height_mean_m": _mean(final_pos[:, 2]),
+        "final_base_clearance_mean_m": _mean(base_clearance),
+        "final_base_clearance_min_m": base_clearance.min().item(),
+        "final_abs_roll_mean_rad": _mean(torch.abs(final_euler[:, 0])),
+        "final_abs_pitch_mean_rad": _mean(torch.abs(final_euler[:, 1])),
+        "final_abs_yaw_mean_rad": _mean(torch.abs(final_euler[:, 2])),
+        "vel_xy_error_mean": _mean(vel_xy_error),
+        "vel_yaw_error_mean": _mean(vel_yaw_error),
+        "motion_success_rate": motion_success_rate,
+        "target_distance_x_m": target_distance_x,
+        "target_distance_y_m": target_distance_y,
+        "target_yaw_rad": target_yaw,
+        "strict_success_rate": strict_success_rate,
+        "success_min_distance_x": success_min_distance_x,
+        "success_min_terrain_gain": success_min_terrain_gain,
+        "success_min_clearance": success_min_clearance,
+        "viewer_closed": viewer_closed,
+    }
+    if env_cfg.get("terrain_type") == "stair":
+        result["terrain_step_height"] = env_cfg.get("terrain_step_height")
+        result["terrain_step_width"] = env_cfg.get("terrain_step_width")
+    for key, values in term_sums.items():
+        result[f"term_{key}_rate"] = values.mean().item()
+    return result
+
+
+def print_evaluation_summary(result, exp_name, env_name, ckpt):
+    print("\nEvaluation summary")
+    print(f"exp_name: {exp_name}")
+    print(f"env: {env_name}")
+    print(f"ckpt: {ckpt}")
+    ordered_keys = [
+        "terrain_type",
+        "terrain_step_height",
+        "terrain_step_width",
+        "num_envs",
+        "command",
+        "motion_type",
+        "survival_rate",
+        "duration_mean_s",
+        "distance_x_mean_m",
+        "distance_y_mean_m",
+        "distance_z_mean_m",
+        "terrain_height_gain_mean_m",
+        "terrain_height_gain_max_m",
+        "terrain_height_gain_min_m",
+        "final_base_height_mean_m",
+        "final_base_clearance_mean_m",
+        "final_base_clearance_min_m",
+        "final_abs_roll_mean_rad",
+        "final_abs_pitch_mean_rad",
+        "final_abs_yaw_mean_rad",
+        "vel_xy_error_mean",
+        "vel_yaw_error_mean",
+        "term_roll_rate",
+        "term_pitch_rate",
+        "term_low_height_rate",
+        "term_high_height_rate",
+        "term_timeout_rate",
+        "motion_success_rate",
+        "target_distance_x_m",
+        "target_distance_y_m",
+        "target_yaw_rad",
+        "strict_success_rate",
+        "success_min_distance_x",
+        "success_min_terrain_gain",
+        "success_min_clearance",
+    ]
+    for key in ordered_keys:
+        if key not in result:
+            continue
+        value = result[key]
+        if isinstance(value, float):
+            print(f"{key}: {value:.4f}")
+        else:
+            print(f"{key}: {value}")
+    if result.get("viewer_closed"):
+        print("viewer_closed: true")
 
 
 def main():
@@ -141,186 +422,20 @@ def main():
         torch.load = original_torch_load
     policy = runner.get_inference_policy(device=device)
 
-    obs, _ = env.reset()
     command = build_command(args, command_cfg, reward_cfg, env.device, num_envs)
-    start_pos = env.base_pos.clone()
-    start_terrain_height = env._terrain_height_at(start_pos[:, 0], start_pos[:, 1])
-    max_steps = int(args.duration_s / env.dt)
-
-    active = torch.ones(num_envs, device=env.device, dtype=torch.bool)
-    done_steps = torch.full((num_envs,), max_steps, device=env.device, dtype=gs.tc_float)
-    final_pos = env.base_pos.clone()
-    vel_xy_error_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
-    vel_yaw_error_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
-    term_sums = {
-        "roll": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
-        "pitch": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
-        "low_height": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
-        "high_height": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
-        "timeout": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
-    }
-    viewer_closed = False
-
-    with torch.no_grad():
-        for step in range(max_steps):
-            env.commands[:] = command
-            pre_step_pos = env.base_pos.clone()
-            actions = policy(obs)
-            active_before = active.clone()
-            try:
-                obs, _, _, dones, extras = env.step(actions, is_train=False)
-            except gs.GenesisException as exc:
-                if args.show_viewer and "Viewer closed" in str(exc):
-                    viewer_closed = True
-                    final_pos[active_before] = pre_step_pos[active_before]
-                    done_steps[active_before] = step
-                    active[active_before] = False
-                    break
-                raise
-
-            lin_vel_error = torch.sum(torch.square(command[:, :2] - env.base_lin_vel[:, :2]), dim=1)
-            yaw_error = torch.square(command[:, 2] - env.base_ang_vel[:, 2])
-            vel_xy_error_sum[active_before] += lin_vel_error[active_before] * env.dt
-            vel_yaw_error_sum[active_before] += yaw_error[active_before] * env.dt
-
-            newly_done = active_before & dones.bool()
-            if newly_done.any():
-                done_steps[newly_done] = step + 1
-                final_pos[newly_done] = pre_step_pos[newly_done]
-                for key in term_sums:
-                    term_key = "term_" + key
-                    if term_key in extras:
-                        term_sums[key][newly_done] = extras[term_key][newly_done]
-                active[newly_done] = False
-
-            if args.real_time:
-                time.sleep(env.dt)
-            if not active.any():
-                break
-
-    if args.show_viewer and args.hold_viewer_s > 0.0 and not viewer_closed:
-        time.sleep(args.hold_viewer_s)
-
-    duration = done_steps * env.dt
-    if active.any():
-        final_pos[active] = env.base_pos[active]
-    final_euler = env.base_euler.clone()
-    distance = final_pos - start_pos
-    final_terrain_height = env._terrain_height_at(final_pos[:, 0], final_pos[:, 1])
-    terrain_height_gain = final_terrain_height - start_terrain_height
-    base_clearance = final_pos[:, 2] - final_terrain_height
-    vel_xy_error = vel_xy_error_sum / torch.clamp(duration, min=env.dt)
-    vel_yaw_error = vel_yaw_error_sum / torch.clamp(duration, min=env.dt)
-    failure = (
-        (term_sums["roll"] > 0.0)
-        | (term_sums["pitch"] > 0.0)
-        | (term_sums["low_height"] > 0.0)
-        | (term_sums["high_height"] > 0.0)
+    result = evaluate_policy(
+        env=env,
+        policy=policy,
+        command=command,
+        duration_s=args.duration_s,
+        success_min_distance_x=args.success_min_distance_x,
+        success_min_terrain_gain=args.success_min_terrain_gain,
+        success_min_clearance=args.success_min_clearance,
+        real_time=args.real_time,
+        show_viewer=args.show_viewer,
+        hold_viewer_s=args.hold_viewer_s,
     )
-    survival_rate = (~failure).float().mean().item()
-    success_min_distance_x = (
-        args.success_min_distance_x
-        if args.success_min_distance_x is not None
-        else args.lin_vel_x * args.duration_s * 0.8
-    )
-    success_min_terrain_gain = (
-        args.success_min_terrain_gain
-        if args.success_min_terrain_gain is not None
-        else (0.0 if env_cfg.get("terrain_type") != "stair" else env_cfg.get("terrain_step_height", 0.0) * 3.0)
-    )
-    target_distance_x = args.lin_vel_x * args.duration_s
-    target_distance_y = args.lin_vel_y * args.duration_s
-    target_yaw = args.ang_vel * args.duration_s
-    abs_cmd_x = abs(args.lin_vel_x)
-    abs_cmd_y = abs(args.lin_vel_y)
-    abs_cmd_yaw = abs(args.ang_vel)
-
-    if abs_cmd_yaw > max(abs_cmd_x, abs_cmd_y) and abs_cmd_yaw > 1e-6:
-        motion_type = "yaw"
-        target_yaw_min = abs(target_yaw) * 0.6
-        motion_success = (
-            active
-            & (torch.abs(final_euler[:, 2]) >= target_yaw_min)
-            & (torch.abs(distance[:, 0]) <= max(0.5, abs(target_yaw) * 0.15))
-            & (torch.abs(distance[:, 1]) <= max(0.5, abs(target_yaw) * 0.15))
-            & (base_clearance >= args.success_min_clearance)
-        )
-    elif abs_cmd_y > abs_cmd_x and abs_cmd_y > 1e-6:
-        motion_type = "lateral_positive" if args.lin_vel_y > 0.0 else "lateral_negative"
-        target_distance_y_min = abs(target_distance_y) * 0.8
-        motion_success = (
-            active
-            & ((distance[:, 1] * (1.0 if args.lin_vel_y > 0.0 else -1.0)) >= target_distance_y_min)
-            & (torch.abs(distance[:, 0]) <= max(0.4, target_distance_y_min * 0.25))
-            & (base_clearance >= args.success_min_clearance)
-        )
-    elif abs_cmd_x > 1e-6:
-        motion_type = "forward" if args.lin_vel_x > 0.0 else "backward"
-        target_distance_x_min = abs(target_distance_x) * 0.8
-        motion_success = (
-            active
-            & ((distance[:, 0] * (1.0 if args.lin_vel_x > 0.0 else -1.0)) >= target_distance_x_min)
-            & (torch.abs(distance[:, 1]) <= max(0.25, target_distance_x_min * 0.15))
-            & (terrain_height_gain >= success_min_terrain_gain)
-            & (base_clearance >= args.success_min_clearance)
-        )
-    else:
-        motion_type = "stand"
-        motion_success = (
-            active
-            & (torch.norm(distance[:, :2], dim=1) <= 0.25)
-            & (base_clearance >= args.success_min_clearance)
-        )
-    motion_success_rate = motion_success.float().mean().item()
-
-    strict_success = (
-        active
-        & (distance[:, 0] >= success_min_distance_x)
-        & (torch.abs(distance[:, 1]) <= 0.25)
-        & (terrain_height_gain >= success_min_terrain_gain)
-        & (base_clearance >= args.success_min_clearance)
-    )
-    strict_success_rate = strict_success.float().mean().item()
-
-    print("\nEvaluation summary")
-    print(f"exp_name: {args.exp_name}")
-    print(f"env: {env_name}")
-    print(f"ckpt: {args.ckpt}")
-    print(f"terrain_type: {env_cfg.get('terrain_type', 'unknown')}")
-    if env_cfg.get("terrain_type") == "stair":
-        print(f"terrain_step_height: {env_cfg.get('terrain_step_height')}")
-        print(f"terrain_step_width: {env_cfg.get('terrain_step_width')}")
-    print(f"num_envs: {num_envs}")
-    print(f"command: {command[0].detach().cpu().tolist()}")
-    print(f"motion_type: {motion_type}")
-    print(f"survival_rate: {survival_rate:.4f}")
-    print(f"duration_mean_s: {duration.mean().item():.4f}")
-    print(f"distance_x_mean_m: {distance[:, 0].mean().item():.4f}")
-    print(f"distance_y_mean_m: {distance[:, 1].mean().item():.4f}")
-    print(f"distance_z_mean_m: {distance[:, 2].mean().item():.4f}")
-    print(f"terrain_height_gain_mean_m: {terrain_height_gain.mean().item():.4f}")
-    print(f"terrain_height_gain_max_m: {terrain_height_gain.max().item():.4f}")
-    print(f"terrain_height_gain_min_m: {terrain_height_gain.min().item():.4f}")
-    print(f"final_base_height_mean_m: {final_pos[:, 2].mean().item():.4f}")
-    print(f"final_base_clearance_mean_m: {base_clearance.mean().item():.4f}")
-    print(f"final_base_clearance_min_m: {base_clearance.min().item():.4f}")
-    print(f"final_abs_roll_mean_rad: {torch.abs(final_euler[:, 0]).mean().item():.4f}")
-    print(f"final_abs_pitch_mean_rad: {torch.abs(final_euler[:, 1]).mean().item():.4f}")
-    print(f"final_abs_yaw_mean_rad: {torch.abs(final_euler[:, 2]).mean().item():.4f}")
-    print(f"vel_xy_error_mean: {vel_xy_error.mean().item():.4f}")
-    print(f"vel_yaw_error_mean: {vel_yaw_error.mean().item():.4f}")
-    for key, values in term_sums.items():
-        print(f"term_{key}_rate: {values.mean().item():.4f}")
-    print(f"motion_success_rate: {motion_success_rate:.4f}")
-    print(f"target_distance_x_m: {target_distance_x:.4f}")
-    print(f"target_distance_y_m: {target_distance_y:.4f}")
-    print(f"target_yaw_rad: {target_yaw:.4f}")
-    print(f"strict_success_rate: {strict_success_rate:.4f}")
-    print(f"success_min_distance_x: {success_min_distance_x:.4f}")
-    print(f"success_min_terrain_gain: {success_min_terrain_gain:.4f}")
-    print(f"success_min_clearance: {args.success_min_clearance:.4f}")
-    if viewer_closed:
-        print("viewer_closed: true")
+    print_evaluation_summary(result, args.exp_name, env_name, args.ckpt)
 
 
 if __name__ == "__main__":

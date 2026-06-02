@@ -110,9 +110,34 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "no_wheel_vel_obs_0601"
-  num_envs: 4096
-  max_iterations: 10000
+  exp_name: "testtest"
+  # 並列に見る環境数。GPUメモリに余裕がある場合はここを増やす。
+  num_envs: 16384
+  # 1環境あたりのrollout長。ここは増やさず、一度に見る環境数でbatchを増やす。
+  num_steps_per_env: 24
+  # rollout batchが大きくなった分、mini-batchサイズが大きくなりすぎないように分割数も増やす。
+  num_mini_batches: 8
+  num_learning_epochs: 5
+  max_iterations: 100
   # env: "Go2Env_Stair"  # Go2本体用。車輪付き確認後に戻す場合はこれを使う。
   env: "Go2WheelEnv"     # 一時確認用: Go2 + 受動車輪モデルを読み込む。
   device: "cuda:0"
+  eval:
+    enabled: false        # trueにすると学習中に評価を実行する
+    interval: 1         # 何iterationごとに評価するか。1なら毎iteration
+    num_envs: 16
+    duration_s: 10.0
+    save_csv: false        # logs/<exp_name>/eval.csvにも保存する
+    commands:
+      - name: forward
+        lin_vel_x: 0.3
+        lin_vel_y: 0.0
+        ang_vel: 0.0
+      - name: lateral_positive
+        lin_vel_x: 0.0
+        lin_vel_y: 0.3
+        ang_vel: 0.0
+      - name: yaw_negative
+        lin_vel_x: 0.0
+        lin_vel_y: 0.0
+        ang_vel: -0.4
