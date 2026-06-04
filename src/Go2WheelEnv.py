@@ -130,6 +130,7 @@ class Go2WheelEnv:
         }
 
         self.base_lin_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
+        self.base_world_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_ang_vel = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.projected_gravity = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.global_gravity = torch.tensor([0.0, 0.0, -1.0], device=self.device, dtype=gs.tc_float).repeat(
@@ -178,6 +179,7 @@ class Go2WheelEnv:
             dtype=torch.long,
         )
         self.feet_air_time = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
+        self.feet_world_vel = torch.zeros((self.num_envs, 4, 3), device=self.device, dtype=gs.tc_float)
         self.last_contacts = torch.zeros((self.num_envs, 4), device=self.device, dtype=torch.bool)
 
         self.default_dof_pos = torch.tensor(
@@ -369,12 +371,14 @@ class Go2WheelEnv:
             transform_quat_by_quat(torch.ones_like(self.base_quat) * self.inv_base_init_quat, self.base_quat)
         )
         inv_base_quat = inv_quat(self.base_quat)
-        self.base_lin_vel[:] = transform_by_quat(self.robot.get_vel(), inv_base_quat)
+        self.base_world_vel[:] = self.robot.get_vel()
+        self.base_lin_vel[:] = transform_by_quat(self.base_world_vel, inv_base_quat)
         self.base_ang_vel[:] = transform_by_quat(self.robot.get_ang(), inv_base_quat)
         self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
         self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
         self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
         self.wheel_dof_vel[:] = self.robot.get_dofs_velocity(self.wheel_dofs)
+        self.feet_world_vel[:] = self.robot.get_links_vel()[:, self.feet_indices, :]
 
         envs_idx = (
             (self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
@@ -487,6 +491,7 @@ class Go2WheelEnv:
         self.base_quat[envs_idx] = self.base_init_quat.reshape(1, -1)
         self.robot.set_pos(self.base_pos[envs_idx], zero_velocity=True, envs_idx=envs_idx)
         self.robot.set_quat(self.base_quat[envs_idx], zero_velocity=True, envs_idx=envs_idx)
+        self.base_world_vel[envs_idx] = 0
         self.base_lin_vel[envs_idx] = 0
         self.base_ang_vel[envs_idx] = 0
         self.robot.zero_all_dofs_velocity(envs_idx)
@@ -498,6 +503,7 @@ class Go2WheelEnv:
         self.jump_toggled_buf[envs_idx] = 0.0
         self.jump_target_height[envs_idx] = 0.0
         self.feet_air_time[envs_idx] = 0.0
+        self.feet_world_vel[envs_idx] = 0.0
         self.last_contacts[envs_idx] = False
         self.obs_history_buf[envs_idx] = 0.0
 
@@ -581,3 +587,13 @@ class Go2WheelEnv:
 
     def _reward_feet_air_time(self):
         return torch.sum(self.feet_air_time, dim=1)
+
+    def _reward_contact_leg_forward_vel_penalty(self):
+        # 接地中の車輪リンクが胴体前後方向に動くほど罰する。
+        active_mask = (self.jump_toggled_buf < 0.01).float()
+        rel_vel_w = self.feet_world_vel - self.base_world_vel.unsqueeze(1)
+        inv_base_quat = inv_quat(self.base_quat).repeat_interleave(4, dim=0)
+        rel_vel_b = transform_by_quat(rel_vel_w.reshape(-1, 3), inv_base_quat).reshape(self.num_envs, 4, 3)
+        forward_vel = rel_vel_b[:, :, 0]
+        contact_mask = self.last_contacts.float()
+        return active_mask * torch.sum(torch.square(forward_vel) * contact_mask, dim=1)

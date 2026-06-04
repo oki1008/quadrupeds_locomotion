@@ -70,7 +70,7 @@ env_cfg:
 # policyに渡す観測の設定
 obs_cfg:
   # 受動車輪4関節の角速度を観測に入れる
-  use_wheel_vel_obs: false
+  use_wheel_vel_obs: true
   # 観測に高さ情報を入れる
   use_height_obs: false
   num_history: 3
@@ -98,6 +98,7 @@ reward_cfg:
     base_height: -1.0          # 胴体高さを目標値付近に保つ罰則
     action_rate: -0.02         # 行動の急変を抑えて滑らかな動きにする罰則
     similar_to_default: -0.08  # 関節角度が初期姿勢から大きく外れるのを抑える罰則
+    contact_leg_forward_vel_penalty: -0.3  # 接地中に脚を前後へ蹴る動きを抑え、車輪で転がる動きを促す
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
@@ -110,7 +111,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "testtest"
+  exp_name: "true_wheel_0604"
   # 並列に見る環境数。GPUメモリに余裕がある場合はここを増やす。
   num_envs: 16384
   # 1環境あたりのrollout長。ここは増やさず、一度に見る環境数でbatchを増やす。
@@ -118,13 +119,13 @@ train_cfg:
   # rollout batchが大きくなった分、mini-batchサイズが大きくなりすぎないように分割数も増やす。
   num_mini_batches: 8
   num_learning_epochs: 5
-  max_iterations: 100
+  max_iterations: 10000
   # env: "Go2Env_Stair"  # Go2本体用。車輪付き確認後に戻す場合はこれを使う。
   env: "Go2WheelEnv"     # 一時確認用: Go2 + 受動車輪モデルを読み込む。
   device: "cuda:0"
   eval:
     enabled: false        # trueにすると学習中に評価を実行する
-    interval: 1         # 何iterationごとに評価するか。1なら毎iteration
+    interval: 100         # 何iterationごとに評価するか。
     num_envs: 16
     duration_s: 10.0
     save_csv: false        # logs/<exp_name>/eval.csvにも保存する
