@@ -166,6 +166,7 @@ class Go2WheelEnv:
         self.dof_pos = torch.zeros_like(self.actions)
         self.dof_vel = torch.zeros_like(self.actions)
         self.last_dof_vel = torch.zeros_like(self.actions)
+        self.motor_dof_force = torch.zeros_like(self.actions)
         self.wheel_dof_vel = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
         self.base_pos = torch.zeros((self.num_envs, 3), device=self.device, dtype=gs.tc_float)
         self.base_quat = torch.zeros((self.num_envs, 4), device=self.device, dtype=gs.tc_float)
@@ -377,6 +378,7 @@ class Go2WheelEnv:
         self.projected_gravity = transform_by_quat(self.global_gravity, inv_base_quat)
         self.dof_pos[:] = self.robot.get_dofs_position(self.motor_dofs)
         self.dof_vel[:] = self.robot.get_dofs_velocity(self.motor_dofs)
+        self.motor_dof_force[:] = self.robot.get_dofs_control_force(self.motor_dofs)
         self.wheel_dof_vel[:] = self.robot.get_dofs_velocity(self.wheel_dofs)
         self.feet_world_vel[:] = self.robot.get_links_vel()[:, self.feet_indices, :]
 
@@ -472,6 +474,7 @@ class Go2WheelEnv:
         # 関節をデフォルト姿勢に戻す。
         self.dof_pos[envs_idx] = self.default_dof_pos
         self.dof_vel[envs_idx] = 0.0
+        self.motor_dof_force[envs_idx] = 0.0
         self.wheel_dof_vel[envs_idx] = 0.0
         self.robot.set_dofs_position(
             position=self.dof_pos[envs_idx],
@@ -573,6 +576,11 @@ class Go2WheelEnv:
     def _reward_dof_vel(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()
         return active_mask * torch.sum(torch.square(self.dof_vel), dim=1)
+
+    def _reward_joint_power(self):
+        # 制御12関節の仕事率。脚で頑張りすぎる動きを抑える。
+        active_mask = (self.jump_toggled_buf < 0.01).float()
+        return active_mask * torch.sum(torch.abs(self.motor_dof_force * self.dof_vel), dim=1)
 
     def _reward_similar_to_default(self):
         active_mask = (self.jump_toggled_buf < 0.01).float()

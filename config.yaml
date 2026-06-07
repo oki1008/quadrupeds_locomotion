@@ -98,7 +98,8 @@ reward_cfg:
     base_height: -1.0          # 胴体高さを目標値付近に保つ罰則
     action_rate: -0.02         # 行動の急変を抑えて滑らかな動きにする罰則
     similar_to_default: -0.08  # 関節角度が初期姿勢から大きく外れるのを抑える罰則
-    contact_leg_forward_vel_penalty: -0.3  # 接地中に脚を前後へ蹴る動きを抑え、車輪で転がる動きを促す
+    contact_leg_forward_vel_penalty: -0.0 # 接地中に脚を前後へ蹴る動きを抑え、車輪で転がる動きを促す
+    joint_power: -0.00002      # 脚12関節の仕事率を抑え、省エネな転がりを促す罰則
 
 command_cfg:
   num_commands: 5  # [lin_vel_x, lin_vel_y, ang_vel, height, jump]
@@ -111,7 +112,7 @@ command_cfg:
   jump_range: [0.0, 0.0]
 
 train_cfg:
-  exp_name: "true_wheel_0604"
+  exp_name: "true_wheel_0607"
   # 並列に見る環境数。GPUメモリに余裕がある場合はここを増やす。
   num_envs: 16384
   # 1環境あたりのrollout長。ここは増やさず、一度に見る環境数でbatchを増やす。

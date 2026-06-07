@@ -130,6 +130,24 @@ def evaluate_policy(
     final_pos = env.base_pos.clone()
     vel_xy_error_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
     vel_yaw_error_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+    has_wheel_metrics = all(
+        hasattr(env, name)
+        for name in ("wheel_dof_vel", "last_contacts", "base_lin_vel")
+    )
+    has_power_metrics = all(
+        hasattr(env, name)
+        for name in ("motor_dof_force", "dof_vel")
+    )
+    wheel_radius = env_cfg.get("wheel_radius", 0.055)
+    if has_wheel_metrics:
+        wheel_abs_vel_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+        contact_wheel_abs_vel_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+        wheel_ground_speed_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+        rolling_to_body_speed_ratio_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+        wheel_contact_ratio_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+        contact_leg_forward_penalty_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
+    if has_power_metrics:
+        joint_power_sum = torch.zeros(num_envs, device=env.device, dtype=gs.tc_float)
     term_sums = {
         "roll": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
         "pitch": torch.zeros(num_envs, device=env.device, dtype=gs.tc_float),
@@ -160,6 +178,27 @@ def evaluate_policy(
             yaw_error = torch.square(command[:, 2] - env.base_ang_vel[:, 2])
             vel_xy_error_sum[active_before] += lin_vel_error[active_before] * env.dt
             vel_yaw_error_sum[active_before] += yaw_error[active_before] * env.dt
+            if has_wheel_metrics:
+                wheel_abs_vel = torch.mean(torch.abs(env.wheel_dof_vel), dim=1)
+                contact_mask = env.last_contacts.float()
+                contact_count = torch.clamp(torch.sum(contact_mask, dim=1), min=1.0)
+                contact_wheel_abs_vel = torch.sum(torch.abs(env.wheel_dof_vel) * contact_mask, dim=1) / contact_count
+                wheel_ground_speed = wheel_abs_vel * wheel_radius
+                body_xy_speed = torch.norm(env.base_lin_vel[:, :2], dim=1)
+                rolling_to_body_speed_ratio = wheel_ground_speed / torch.clamp(body_xy_speed, min=1e-4)
+                wheel_contact_ratio = torch.mean(contact_mask, dim=1)
+
+                wheel_abs_vel_sum[active_before] += wheel_abs_vel[active_before] * env.dt
+                contact_wheel_abs_vel_sum[active_before] += contact_wheel_abs_vel[active_before] * env.dt
+                wheel_ground_speed_sum[active_before] += wheel_ground_speed[active_before] * env.dt
+                rolling_to_body_speed_ratio_sum[active_before] += rolling_to_body_speed_ratio[active_before] * env.dt
+                wheel_contact_ratio_sum[active_before] += wheel_contact_ratio[active_before] * env.dt
+                if hasattr(env, "_reward_contact_leg_forward_vel_penalty"):
+                    contact_penalty = env._reward_contact_leg_forward_vel_penalty()
+                    contact_leg_forward_penalty_sum[active_before] += contact_penalty[active_before] * env.dt
+            if has_power_metrics:
+                joint_power = torch.sum(torch.abs(env.motor_dof_force * env.dof_vel), dim=1)
+                joint_power_sum[active_before] += joint_power[active_before] * env.dt
 
             newly_done = active_before & dones.bool()
             if newly_done.any():
@@ -189,6 +228,15 @@ def evaluate_policy(
     base_clearance = final_pos[:, 2] - final_terrain_height
     vel_xy_error = vel_xy_error_sum / torch.clamp(duration, min=env.dt)
     vel_yaw_error = vel_yaw_error_sum / torch.clamp(duration, min=env.dt)
+    if has_wheel_metrics:
+        wheel_abs_vel_mean = wheel_abs_vel_sum / torch.clamp(duration, min=env.dt)
+        contact_wheel_abs_vel_mean = contact_wheel_abs_vel_sum / torch.clamp(duration, min=env.dt)
+        wheel_ground_speed_mean = wheel_ground_speed_sum / torch.clamp(duration, min=env.dt)
+        rolling_to_body_speed_ratio_mean = rolling_to_body_speed_ratio_sum / torch.clamp(duration, min=env.dt)
+        wheel_contact_ratio_mean = wheel_contact_ratio_sum / torch.clamp(duration, min=env.dt)
+        contact_leg_forward_penalty_mean = contact_leg_forward_penalty_sum / torch.clamp(duration, min=env.dt)
+    if has_power_metrics:
+        joint_power_mean = joint_power_sum / torch.clamp(duration, min=env.dt)
     failure = (
         (term_sums["roll"] > 0.0)
         | (term_sums["pitch"] > 0.0)
@@ -291,6 +339,19 @@ def evaluate_policy(
         "success_min_clearance": success_min_clearance,
         "viewer_closed": viewer_closed,
     }
+    if has_wheel_metrics:
+        result.update(
+            {
+                "wheel_abs_vel_mean_rad_s": _mean(wheel_abs_vel_mean),
+                "contact_wheel_abs_vel_mean_rad_s": _mean(contact_wheel_abs_vel_mean),
+                "wheel_ground_speed_mean_m_s": _mean(wheel_ground_speed_mean),
+                "rolling_to_body_speed_ratio_mean": _mean(rolling_to_body_speed_ratio_mean),
+                "wheel_contact_ratio_mean": _mean(wheel_contact_ratio_mean),
+                "contact_leg_forward_penalty_raw_mean": _mean(contact_leg_forward_penalty_mean),
+            }
+        )
+    if has_power_metrics:
+        result["joint_power_mean"] = _mean(joint_power_mean)
     if env_cfg.get("terrain_type") == "stair":
         result["terrain_step_height"] = env_cfg.get("terrain_step_height")
         result["terrain_step_width"] = env_cfg.get("terrain_step_width")
@@ -327,6 +388,13 @@ def print_evaluation_summary(result, exp_name, env_name, ckpt):
         "final_abs_yaw_mean_rad",
         "vel_xy_error_mean",
         "vel_yaw_error_mean",
+        "wheel_abs_vel_mean_rad_s",
+        "contact_wheel_abs_vel_mean_rad_s",
+        "wheel_ground_speed_mean_m_s",
+        "rolling_to_body_speed_ratio_mean",
+        "wheel_contact_ratio_mean",
+        "contact_leg_forward_penalty_raw_mean",
+        "joint_power_mean",
         "term_roll_rate",
         "term_pitch_rate",
         "term_low_height_rate",
