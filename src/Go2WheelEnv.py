@@ -577,6 +577,12 @@ class Go2WheelEnv:
         active_mask = (self.jump_toggled_buf < 0.01).float()
         return active_mask * torch.sum(torch.square(self.dof_vel), dim=1)
 
+    def _reward_dof_acc(self):
+        # 関節速度の急変を抑え、こぎ続けるような細かい脚運動を減らす。
+        active_mask = (self.jump_toggled_buf < 0.01).float()
+        dof_acc = (self.dof_vel - self.last_dof_vel) / self.dt
+        return active_mask * torch.sum(torch.square(dof_acc), dim=1)
+
     def _reward_joint_power(self):
         # 制御12関節の仕事率。脚で頑張りすぎる動きを抑える。
         active_mask = (self.jump_toggled_buf < 0.01).float()
